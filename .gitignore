@@ -1,0 +1,5 @@
+data
+ckpt
+__pycache__/
+*.py[cod]
+pseudo_label_s3dis/

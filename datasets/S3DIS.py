@@ -125,7 +125,7 @@ class S3DIStrain(Dataset):
         scale = 1 / self.args.voxel_size
         coords = np.floor(coords * scale)
         coords, feats, labels, unique_map, inverse_map = ME.utils.sparse_quantize(np.ascontiguousarray(coords), feats, labels=labels, ignore_label=-1, return_index=True, return_inverse=True)
-        return coords.numpy(), feats, labels, unique_map, clip_inds, inverse_map.numpy()
+        return coords, feats, labels, unique_map, clip_inds, inverse_map
 
 
     def __len__(self):
@@ -148,7 +148,7 @@ class S3DIStrain(Dataset):
         if clip_inds is not None:
             region = region[clip_inds]
         region = region[unique_map]
-
+        
         coords, colors = self.augs(coords, colors)
 
         ''' Take Mixup as an Augmentation'''
@@ -247,7 +247,7 @@ class S3DIStest(Dataset):
         scale = 1 / self.args.voxel_size
         coords = np.floor(coords * scale)
         coords, feats, labels, unique_map, inverse_map = ME.utils.sparse_quantize(np.ascontiguousarray(coords), feats, labels=labels, ignore_label=-1, return_index=True, return_inverse=True)
-        return coords.numpy(), feats, labels, unique_map, inverse_map.numpy()
+        return coords, feats, labels, unique_map, inverse_map
 
 
     def __len__(self):

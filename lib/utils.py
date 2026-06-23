@@ -6,14 +6,18 @@ import os
 from sklearn.cluster import KMeans
 import MinkowskiEngine as ME
 
+from tqdm import tqdm
+from .my_utils import VisualizationThreadPool
 
-def get_sp_feature(args, loader, model, current_growsp):
+def get_sp_feature(args, loader, model, current_growsp, vis=False):
     print('computing point feats ....')
     point_feats_list = []
     point_labels_list = []
     all_sp_index = []
     model.eval()
     context = []
+    if vis:
+        vis_pool = VisualizationThreadPool(max_threads=4)
     with torch.no_grad():
         for batch_idx, data in enumerate(loader):
             coords, features, normals, labels, inverse_map, pseudo_labels, inds, region, index = data
@@ -48,7 +52,11 @@ def get_sp_feature(args, loader, model, current_growsp):
             region_corr = region_corr.cuda()##[N, M]
             per_region_num = region_corr.sum(0, keepdims=True).t()
             ###
-            region_feats = F.linear(region_corr.t(), feats.t())/per_region_num
+            # region_num为region标签的数目
+            # region标签和label标签对应 数量相等 值不等
+            # region标签来自于region合并后的重赋值
+            # region_corr是 01矩阵 N*M 通过 region_feats为region的特征均值
+            region_feats = F.linear(region_corr.t(), feats.t())/per_region_num  # 特征原型中心 region_corr对应位置为region 其特征feats
             if current_growsp is not None:
                 region_rgb = F.linear(region_corr.t(), pc_rgb.t())/per_region_num
                 region_xyz = F.linear(region_corr.t(), pc_xyz.t())/per_region_num
@@ -62,22 +70,26 @@ def get_sp_feature(args, loader, model, current_growsp):
                     n_segments = region_feats.size(0)
                 else:
                     n_segments = current_growsp
+                    
+                # region_sizes = per_region_num.squeeze()  # [num_regions]
+                # sp_idx_bf = torch.from_numpy(KMeans(n_clusters=n_segments + 1, n_init=5, random_state=0, n_jobs=5).fit_predict(region_feats.cpu().numpy())).long()
+                # sp_idx = masked_kmeans_consensus(region_feats, n_segments, n_rounds=10, mask_prob=0.3)
                 sp_idx = torch.from_numpy(KMeans(n_clusters=n_segments, n_init=5, random_state=0, n_jobs=5).fit_predict(region_feats.cpu().numpy())).long()
             else:
                 feats = region_feats
                 sp_idx = torch.tensor(range(region_feats.size(0)))
 
-            neural_region = sp_idx[region]
+            neural_region = sp_idx[region]  # 每个点的region标签 基于region的
             pfh = []
 
             neural_region_num = len(torch.unique(neural_region))
             neural_region_corr = torch.zeros(neural_region.size(0), neural_region_num)
-            neural_region_corr.scatter_(1, neural_region.view(-1, 1), 1)
+            neural_region_corr.scatter_(1, neural_region.view(-1, 1), 1)  # 可以看出one hot 编码的region标签
             neural_region_corr = neural_region_corr.cuda()
             per_neural_region_num = neural_region_corr.sum(0, keepdims=True).t()
             #
             '''Compute avg rgb/pfh for each Superpoints to help Primitives Learning'''
-            final_rgb = F.linear(neural_region_corr.t(), pc_rgb.t())/per_neural_region_num
+            final_rgb = F.linear(neural_region_corr.t(), pc_rgb.t())/per_neural_region_num  # rgb原型中心
             #
             if current_growsp is not None:
                 feats = F.linear(neural_region_corr.t(), feats.t()) / per_neural_region_num
@@ -90,15 +102,54 @@ def get_sp_feature(args, loader, model, current_growsp):
 
             pfh = torch.cat(pfh, dim=0)
             feats = F.normalize(feats, dim=-1)
+
+            # coords_xyz = pc_xyz  # 已经是 voxel 尺度的
+            # ms_geo = compute_multiscale_geometry(coords_xyz, normals, neural_region)
             # #
-            feats = torch.cat((feats, args.c_rgb*final_rgb, args.c_shape*pfh), dim=-1)
+            # final_rgb = F.normalize(final_rgb, dim=-1)
+            # pfh = F.normalize(pfh, dim=-1)
+            # 128 + 3 + 10
+
+            if getattr(args, 'z_enable', False):
+                feats = torch.cat((feats, args.c_shape*pfh), dim=-1)
+                
+                region_z = pc_xyz[:, 2:3]
+
+                if current_growsp is not None:
+                    out = F.linear(neural_region_corr.t(), region_z.t())
+                    region_z_mean = out / per_neural_region_num
+                    region_z_max = out.max(dim=1, keepdim=True)[0]
+                    region_z_min = out.min(dim=1, keepdim=True)[0]
+                else:
+                    out = F.linear(region_corr.t(), region_z.t())
+                    region_z_mean = out / per_neural_region_num
+                    region_z_max = out.max(dim=1, keepdim=True)[0]
+                    region_z_min = out.min(dim=1, keepdim=True)[0]
+                region_z = torch.cat((region_z_mean, region_z_max, region_z_min), dim=-1)
+
+                region_z = F.normalize(region_z, dim=-1)
+                
+                feats = torch.cat((feats, region_z), dim=-1)
+            else:
+                feats = torch.cat((feats, args.c_rgb*final_rgb, args.c_shape*pfh), dim=-1)
+
             feats = F.normalize(feats, dim=-1)
+
+            # if args.tcc_enable:
+            #     feats = torch.cat((feats, per_neural_region_num), dim=-1)
 
             point_feats_list.append(feats.cpu())
             point_labels_list.append(labels.cpu())
 
             all_sp_index.append(neural_region)
-            context.append((scene_name, gt, raw_region))
+
+            if vis:
+                context.append((scene_name, gt, raw_region, coords, inverse_map))
+                vis_path = '/home/magic/magic/cm/repositories/GrowSP/data/S3DIS/sp_vis'
+                vis_pool.submit_task(coords, scene_name, valid_mask, inverse_map, neural_region.numpy(), vis_path)
+                vis_pool.clean_up()
+            else:
+                context.append((scene_name, gt, raw_region))
 
             torch.cuda.empty_cache()
             torch.cuda.synchronize(torch.device("cuda"))
@@ -114,7 +165,7 @@ def get_kittisp_feature(args, loader, model, current_growsp):
     model.eval()
     context = []
     with torch.no_grad():
-        for batch_idx, data in enumerate(loader):
+        for batch_idx, data in enumerate(tqdm(loader)):
             coords, features, normals, labels, inverse_map, pseudo_labels, inds, region, index = data
 
             region = region.squeeze()
@@ -206,6 +257,9 @@ def get_pseudo(args, context, cluster_pred, all_sp_index=None):
     all_pseudo_gt = []
     pc_no = 0
     region_num = 0
+    
+    pe_gt_labels = -np.ones_like(cluster_pred).astype(np.int32) # 核心：存储每个超点的真实标签（按超点顺序） 
+    sp_gt_labels = []  # 核心：存储每个超点的真实标签（按超点顺序）
 
     for i in range(len(context)):
         scene_name, labels, region = context[i]
@@ -214,17 +268,32 @@ def get_pseudo(args, context, cluster_pred, all_sp_index=None):
         valid_mask = region != -1
 
         labels_tmp = labels[valid_mask]
+        region_tmp = region[valid_mask]       # 点级：有效点对应的超点ID（场景内局部）
         pseudo_gt = -torch.ones_like(labels)
         pseudo_gt_tmp = pseudo_gt[valid_mask]
 
         pseudo = -np.ones_like(labels.numpy()).astype(np.int32)
         pseudo[valid_mask] = cluster_pred[sub_cluster_pred]
+        scene_sp_gt = []
+        for local_sp_id in np.unique(region_tmp):
+            sp_point_mask = (region_tmp == local_sp_id)
+            single_sp_gt = torch.mode(labels_tmp[sp_point_mask]).values
+            scene_sp_gt.append(single_sp_gt.item()) 
+
+        sp_gt_labels.extend(scene_sp_gt)
 
         for p in np.unique(sub_cluster_pred):
             if p != -1:
                 mask = p == sub_cluster_pred
                 sub_cluster_gt = torch.mode(labels_tmp[mask]).values
                 pseudo_gt_tmp[mask] = sub_cluster_gt
+                
+                if pe_gt_labels[p] == -1:
+                    pe_gt_labels[p] = sub_cluster_gt
+                else:
+                    if pe_gt_labels[p] != sub_cluster_gt:
+                        print(f"[Warning] conflict at cluster {p}: {pe_gt_labels[p]} vs {sub_cluster_gt}")
+
         pseudo_gt[valid_mask] = pseudo_gt_tmp
         #
         pc_no += 1
@@ -241,8 +310,10 @@ def get_pseudo(args, context, cluster_pred, all_sp_index=None):
     all_gt = np.concatenate(all_gt)
     all_pseudo = np.concatenate(all_pseudo)
     all_pseudo_gt = np.concatenate(all_pseudo_gt)
-
-    return all_pseudo, all_gt, all_pseudo_gt
+    # 超点级真实标签转numpy
+    sp_gt_labels = np.array(sp_gt_labels, dtype=np.int32)
+    
+    return all_pseudo, all_gt, all_pseudo_gt, sp_gt_labels, pe_gt_labels
 
 
 def get_pseudo_kitti(args, context, cluster_pred, all_sub_cluster=None):
@@ -253,7 +324,7 @@ def get_pseudo_kitti(args, context, cluster_pred, all_sub_cluster=None):
     pc_no = 0
     region_num = 0
 
-    for i in range(len(context)):
+    for i in tqdm(range(len(context))):
         scene_name, labels, region = context[i]
 
         sub_cluster_pred = all_sub_cluster[pc_no]+ region_num
