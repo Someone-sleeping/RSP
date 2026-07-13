@@ -12,6 +12,13 @@ from torch.utils.data import DataLoader
 
 from datasets.S3DIS import S3DIStest, cfl_collate_fn_test
 from eval_S3DIS import compute_unsupervised_metrics
+from lib.correction_strategies import (
+    error_type_conditioned_refinement,
+    hierarchical_split_merge,
+    local_consensus_verifier,
+    region_risk_rollback,
+    regionwise_refiner_scale_selection,
+)
 from lib.meta_optimizer import meta_optimize_poe_weight
 from lib.split_regions import build_region_consistency_queries, build_split_region_queries
 from models.fpn import Res16FPN18
@@ -43,6 +50,7 @@ def parse_args():
     parser.add_argument("--min_temporal_votes", type=int, default=2)
     parser.add_argument("--refiner_checkpoint", default="")
     parser.add_argument("--refiner_scale", type=float, default=1.0)
+    parser.add_argument("--refiner_scales", default="0.5,0.75,1.0,1.25")
     parser.add_argument("--refiner_hidden_dim", type=int, default=128)
     parser.add_argument("--refiner_num_heads", type=int, default=4)
     parser.add_argument("--blend_weights", default="0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9")
@@ -55,6 +63,9 @@ def parse_args():
     parser.add_argument("--meta_entropy_weight", type=float, default=0.01)
     parser.add_argument("--meta_query_tolerance", type=float, default=0.0)
     parser.add_argument("--meta_classwise", action="store_true", default=False)
+    parser.add_argument("--four_stage_diagnostic", action="store_true", default=False)
+    parser.add_argument("--diagnostic_multi_proposal", action="store_true", default=False)
+    parser.add_argument("--skip_region_oracle", action="store_true", default=False)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--output_json", default="")
     return parser.parse_args()
@@ -178,7 +189,17 @@ def project_region_and_split(scores, regions, split_targets):
     return projected
 
 
-def run_split_refiner(args, refiner, base_scores, base_feats, coords, features, regions):
+def run_split_refiner(
+    args,
+    refiner,
+    base_scores,
+    base_feats,
+    coords,
+    features,
+    regions,
+    multi_proposal=False,
+    delta_override=None,
+):
     batch_ids = coords[:, 0].long().cuda()
     point_coords = coords[:, 1:].float().cuda()
     point_colors = features[:, :3].float().cuda()
@@ -206,6 +227,7 @@ def run_split_refiner(args, refiner, base_scores, base_feats, coords, features, 
         rgb_weight=0.5,
         feat_weight=0.25,
         semantic_weight=1.0,
+        multi_proposal=multi_proposal,
     )
     (
         consistency_queries,
@@ -231,21 +253,25 @@ def run_split_refiner(args, refiner, base_scores, base_feats, coords, features, 
     keep_mask = keep_mask | consistency_keep
     del refine_mask, keep_mask
 
-    delta_scores = refiner(
-        base_feats,
-        point_coords,
-        batch_ids,
-        query_indices,
-        regions,
-        use_region_branch=False,
-    )
+    if delta_override is None:
+        with torch.no_grad():
+            delta_scores = refiner(
+                base_feats,
+                point_coords,
+                batch_ids,
+                query_indices,
+                regions,
+                use_region_branch=False,
+            )
+    else:
+        delta_scores = delta_override
     no_op_scores = project_region_and_split(base_scores, regions, split_targets)
     refined_scores = project_region_and_split(
         base_scores + args.refiner_scale * delta_scores,
         regions,
         split_targets,
     )
-    return no_op_scores, refined_scores
+    return no_op_scores, refined_scores, delta_scores, split_targets
 
 
 def prediction_mapping(predictions, labels, num_classes):
@@ -261,11 +287,41 @@ def prediction_mapping(predictions, labels, num_classes):
     return pred_to_gt
 
 
+def oracle_diagnostic(base, labels, pred_to_gt, candidates, group_ids=None):
+    """Label-using upper bound for diagnostics only; never used for selection."""
+    oracle = base.copy()
+    if group_ids is None:
+        base_wrong = pred_to_gt[base] != labels
+        for candidate in candidates:
+            candidate_correct = pred_to_gt[candidate] == labels
+            oracle[base_wrong & candidate_correct] = candidate[base_wrong & candidate_correct]
+        return oracle
+
+    order = np.argsort(group_ids, kind="stable")
+    sorted_groups = group_ids[order]
+    boundaries = np.flatnonzero(np.diff(sorted_groups)) + 1
+    starts = np.concatenate(([0], boundaries))
+    ends = np.concatenate((boundaries, [len(order)]))
+    for start, end in zip(starts, ends):
+        indices = order[start:end]
+        best_correct = int((pred_to_gt[base[indices]] == labels[indices]).sum())
+        best_candidate = None
+        for candidate in candidates:
+            correct = int((pred_to_gt[candidate[indices]] == labels[indices]).sum())
+            if correct > best_correct:
+                best_correct = correct
+                best_candidate = candidate
+        if best_candidate is not None:
+            oracle[indices] = best_candidate[indices]
+    return oracle
+
+
 def main():
     args = parse_args()
     reference_epochs = parse_int_list(args.reference_epochs)
     thresholds = parse_float_list(args.thresholds)
     blend_weights = parse_float_list(args.blend_weights)
+    refiner_scales = parse_float_list(args.refiner_scales)
 
     base_model, base_centers = load_reference(args, args.base_epoch)
     temporal_references = []
@@ -333,8 +389,33 @@ def main():
             )
             if args.meta_optimize:
                 names.append(f"meta_adapt_override_t{suffix}")
+    diagnostic_names = []
+    if args.four_stage_diagnostic and refiner is not None:
+        if args.diagnostic_multi_proposal:
+            diagnostic_names.extend(["split_multi_noop", "split_multi_refiner"])
+        diagnostic_names.extend([f"refiner_scale_s{int(round(100 * scale))}" for scale in refiner_scales])
+        diagnostic_names.extend([f"refiner_local_s{int(round(100 * scale))}" for scale in refiner_scales])
+        diagnostic_names.extend([f"scale_meta_s{int(round(100 * scale))}" for scale in refiner_scales])
+        diagnostic_names.extend(
+            [f"scale_select_tw{int(round(10 * weight))}" for weight in (0.0, 0.5, 1.0, 2.0)]
+        )
+        for merge_ratio in (0.15, 0.25, 0.40):
+            diagnostic_names.append(f"split_merge_r{int(round(100 * merge_ratio))}")
+            for support in (1, 2):
+                diagnostic_names.append(
+                    f"typed_refine_r{int(round(100 * merge_ratio))}_s{support}"
+                )
+                for local_support in (3, 4, 5):
+                    diagnostic_names.append(
+                        f"local_verify_r{int(round(100 * merge_ratio))}_s{support}_v{local_support}"
+                    )
+        diagnostic_names.extend([f"meta_local_v{support}" for support in (3, 4, 5)])
+        diagnostic_names.extend([f"meta_region_r{int(round(100 * value))}" for value in (0.4, 0.5, 0.6, 0.7)])
+    names.extend(diagnostic_names)
     all_predictions = {name: [] for name in names}
     all_labels = []
+    all_region_ids = []
+    region_offset = 0
     proxy_sums = {"points": 0.0}
     meta_stats = {
         "scenes": 0,
@@ -441,8 +522,9 @@ def main():
         no_op_pred = None
         refined_pred = None
         meta_adapted_pred = None
+        diagnostic_scale_probabilities = []
         if refiner is not None:
-            no_op_scores, refined_scores = run_split_refiner(
+            no_op_scores, refined_scores, delta_scores, split_targets = run_split_refiner(
                 args,
                 refiner,
                 base_scores,
@@ -477,6 +559,97 @@ def main():
             scene_predictions["split_refiner"] = refined_pred
             scene_predictions["refiner_candidate_vote"] = candidate_vote_pred
             refined_probability = F.softmax(refined_scores, dim=1)
+            if args.four_stage_diagnostic:
+                if args.diagnostic_multi_proposal:
+                    multi_no_op_scores, multi_refined_scores, _multi_delta, _multi_split = run_split_refiner(
+                        args,
+                        refiner,
+                        base_scores,
+                        base_feats,
+                        coords,
+                        features,
+                        regions,
+                        multi_proposal=True,
+                        delta_override=delta_scores,
+                    )
+                    scene_predictions["split_multi_noop"] = multi_no_op_scores.argmax(dim=1)
+                    scene_predictions["split_multi_refiner"] = multi_refined_scores.argmax(dim=1)
+                scale_probabilities = []
+                for scale in refiner_scales:
+                    scale_scores = project_region_and_split(
+                        base_scores + scale * delta_scores,
+                        regions,
+                        split_targets,
+                    )
+                    scale_probability = F.softmax(scale_scores, dim=1)
+                    scale_probabilities.append(scale_probability)
+                    diagnostic_scale_probabilities.append((scale, scale_probability))
+                    scene_predictions[f"refiner_scale_s{int(round(100 * scale))}"] = (
+                        scale_probability.argmax(dim=1)
+                    )
+                    local_prediction = no_op_pred.clone()
+                    non_split = split_targets < 0
+                    local_prediction[non_split] = (
+                        base_scores + scale * delta_scores
+                    ).argmax(dim=1)[non_split]
+                    scene_predictions[f"refiner_local_s{int(round(100 * scale))}"] = local_prediction
+                for temporal_weight in (0.0, 0.5, 1.0, 2.0):
+                    name = f"scale_select_tw{int(round(10 * temporal_weight))}"
+                    scene_predictions[name] = regionwise_refiner_scale_selection(
+                        scale_probabilities,
+                        base_pred,
+                        temporal_mean_prob,
+                        temporal_vote_count,
+                        regions,
+                        temporal_weight=temporal_weight,
+                    )
+                no_op_probability = F.softmax(no_op_scores, dim=1)
+                for merge_ratio in (0.15, 0.25, 0.40):
+                    merge_suffix = int(round(100 * merge_ratio))
+                    split_merge = hierarchical_split_merge(
+                        no_op_pred,
+                        split_targets,
+                        region_pred,
+                        temporal_probabilities,
+                        temporal_mean_prob,
+                        regions,
+                        child_agreement_threshold=0.5,
+                        child_confidence_threshold=0.5,
+                        merge_max_child_ratio=merge_ratio,
+                    )
+                    scene_predictions[f"split_merge_r{merge_suffix}"] = split_merge
+                    for support in (1, 2):
+                        typed_name = f"typed_refine_r{merge_suffix}_s{support}"
+                        typed_prediction = error_type_conditioned_refinement(
+                            split_merge,
+                            no_op_pred,
+                            refined_pred,
+                            refined_probability,
+                            no_op_probability,
+                            region_pred,
+                            split_targets,
+                            temporal_mean_prob,
+                            temporal_vote_count,
+                            min_temporal_votes=args.min_temporal_votes,
+                            temporal_confidence_threshold=0.5,
+                            min_independent_support=support,
+                            confidence_gain=0.01,
+                        )
+                        scene_predictions[typed_name] = typed_prediction
+                        for local_support in (3, 4, 5):
+                            local_name = (
+                                f"local_verify_r{merge_suffix}_s{support}_v{local_support}"
+                            )
+                            scene_predictions[local_name] = local_consensus_verifier(
+                                typed_prediction,
+                                base_pred,
+                                region_pred,
+                                no_op_pred,
+                                temporal_predictions,
+                                temporal_mean_prob,
+                                min_support=local_support,
+                                temporal_confidence_threshold=0.5,
+                            )
             meta_initial_poe_score = (
                 (1.0 - args.meta_initial_weight) * torch.log(refined_probability.clamp_min(1e-6))
                 + args.meta_initial_weight * torch.log(temporal_mean_prob.clamp_min(1e-6))
@@ -580,6 +753,46 @@ def main():
                 meta_init_override = meta_initial_poe_pred.clone()
                 meta_init_override[point_accept] = temporal_mean_pred[point_accept]
 
+                if args.four_stage_diagnostic and abs(threshold - args.selection_threshold) < 1e-6:
+                    for scale, scale_probability in diagnostic_scale_probabilities:
+                        scale_meta_score = (
+                            (1.0 - args.meta_initial_weight)
+                            * torch.log(scale_probability.clamp_min(1e-6))
+                            + args.meta_initial_weight
+                            * torch.log(temporal_mean_prob.clamp_min(1e-6))
+                        )
+                        scale_meta_prediction = scale_meta_score.argmax(dim=1)
+                        scale_meta_prediction[point_accept] = temporal_mean_pred[point_accept]
+                        scene_predictions[f"scale_meta_s{int(round(100 * scale))}"] = (
+                            scale_meta_prediction
+                        )
+
+                if args.four_stage_diagnostic and abs(threshold - args.selection_threshold) < 1e-6:
+                    for support in (3, 4, 5):
+                        scene_predictions[f"meta_local_v{support}"] = local_consensus_verifier(
+                            meta_init_override,
+                            base_pred,
+                            region_pred,
+                            no_op_pred,
+                            temporal_predictions,
+                            temporal_mean_prob,
+                            min_support=support,
+                            temporal_confidence_threshold=threshold,
+                        )
+                    for reliability in (0.4, 0.5, 0.6, 0.7):
+                        scene_predictions[f"meta_region_r{int(round(100 * reliability))}"] = (
+                            region_risk_rollback(
+                                meta_init_override,
+                                refined_pred,
+                                region_pred,
+                                no_op_pred,
+                                temporal_mean_prob,
+                                temporal_vote_count,
+                                regions,
+                                min_region_reliability=reliability,
+                            )
+                        )
+
                 meta_init_region = meta_init_override.clone()
                 meta_region_completion = region_accept & ~point_accept & (
                     (meta_init_override == base_pred)
@@ -642,6 +855,14 @@ def main():
         for name, prediction in scene_predictions.items():
             all_predictions[name].append(prediction[inverse].cpu()[valid])
         all_labels.append(labels[valid])
+        full_regions = regions[inverse].cpu()[valid].long()
+        invalid_region = full_regions < 0
+        full_regions = full_regions + region_offset
+        if invalid_region.any():
+            start = int(full_regions.max().item()) + 1
+            full_regions[invalid_region] = start
+        all_region_ids.append(full_regions)
+        region_offset = int(full_regions.max().item()) + 1
 
     labels_np = torch.cat(all_labels).numpy()
     base_np = torch.cat(all_predictions["base"]).numpy()
@@ -659,6 +880,7 @@ def main():
         }
 
     pred_to_gt = prediction_mapping(base_np, labels_np, args.semantic_class)
+    region_ids_np = torch.cat(all_region_ids).numpy()
     mapped_base = pred_to_gt[base_np]
     oracle = base_np.copy()
     for candidate_name in ["region", "temporal_mean", "temporal_vote"]:
@@ -674,6 +896,77 @@ def main():
         "delta_mIoU": float(oracle_metrics[3] - base_metrics[3]),
         "changed_ratio": float((oracle != base_np).mean()),
     }
+    if diagnostic_names:
+        diagnostic_oracle = base_np.copy()
+        for candidate_name in diagnostic_names:
+            candidate = torch.cat(all_predictions[candidate_name]).numpy()
+            candidate_correct = pred_to_gt[candidate] == labels_np
+            base_wrong = mapped_base != labels_np
+            diagnostic_oracle[base_wrong & candidate_correct] = candidate[base_wrong & candidate_correct]
+        diagnostic_metrics = compute_unsupervised_metrics(
+            diagnostic_oracle, labels_np, args.semantic_class
+        )[:4]
+        results["four_stage_point_oracle_diagnostic"] = {
+            "oAcc": float(diagnostic_metrics[0]),
+            "mAcc": float(diagnostic_metrics[1]),
+            "mIoU": float(diagnostic_metrics[3]),
+            "delta_mIoU": float(diagnostic_metrics[3] - base_metrics[3]),
+            "changed_ratio": float((diagnostic_oracle != base_np).mean()),
+        }
+        oracle_pools = {
+            "split": [
+                name for name in diagnostic_names if name.startswith("split_merge_")
+            ] + ["split_noop", "split_multi_noop"],
+            "refiner": [
+                name
+                for name in diagnostic_names
+                if name.startswith("refiner_scale_")
+                or name.startswith("refiner_local_")
+                or name.startswith("scale_select_")
+                or name.startswith("scale_meta_")
+                or name.startswith("typed_refine_")
+            ] + ["split_refiner", "split_multi_refiner"],
+            "verifier": [
+                name
+                for name in diagnostic_names
+                if name.startswith("local_verify_")
+                or name.startswith("meta_local_")
+                or name.startswith("meta_region_")
+            ] + [
+                f"point_region_union_t{int(round(100 * args.selection_threshold))}",
+                f"refiner_verified_union_t{int(round(100 * args.selection_threshold))}",
+            ],
+            "meta": [
+                f"meta_init_poe_override_t{int(round(100 * args.selection_threshold))}",
+                f"refiner_temporal_poe_w{int(round(100 * args.meta_initial_weight))}",
+            ],
+        }
+        for module_name, pool_names in oracle_pools.items():
+            pool_names = [name for name in pool_names if name in all_predictions]
+            pool_predictions = [
+                torch.cat(all_predictions[name]).numpy() for name in pool_names
+            ]
+            granularities = [("point", None)]
+            if not args.skip_region_oracle:
+                granularities.append(("region", region_ids_np))
+            for granularity, groups in granularities:
+                module_oracle = oracle_diagnostic(
+                    base_np,
+                    labels_np,
+                    pred_to_gt,
+                    pool_predictions,
+                    group_ids=groups,
+                )
+                module_metrics = compute_unsupervised_metrics(
+                    module_oracle, labels_np, args.semantic_class
+                )[:4]
+                results[f"{module_name}_{granularity}_oracle_diagnostic"] = {
+                    "oAcc": float(module_metrics[0]),
+                    "mAcc": float(module_metrics[1]),
+                    "mIoU": float(module_metrics[3]),
+                    "delta_mIoU": float(module_metrics[3] - base_metrics[3]),
+                    "changed_ratio": float((module_oracle != base_np).mean()),
+                }
 
     total_proxy_points = max(proxy_sums.pop("points"), 1.0)
     proxies = {name: value / total_proxy_points for name, value in sorted(proxy_sums.items())}
@@ -736,6 +1029,7 @@ def main():
         with open(args.output_json, "w", encoding="utf-8") as output_file:
             json.dump(
                 {
+                    "config": vars(args),
                     "base_epoch": args.base_epoch,
                     "reference_epochs": reference_epochs,
                     "test_area": args.test_area,
