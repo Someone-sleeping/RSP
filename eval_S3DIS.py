@@ -27,6 +27,8 @@ def parse_args():
                         help='model savepath')
     parser.add_argument('--eval_epoch', type=str, default='1270',
                         help='checkpoint epoch or "best" for direct evaluation')
+    parser.add_argument('--test_area', type=str, default='Area_5',
+                        help='S3DIS held-out area for evaluation, or comma-separated areas')
     ###
     parser.add_argument('--bn_momentum', type=float, default=0.02, help='batchnorm parameters')
     parser.add_argument('--conv1_kernel_size', type=int, default=5, help='kernel size of 1st conv layers')
@@ -44,7 +46,7 @@ def parse_args():
     parser.add_argument('--refine_hidden_dim', type=int, default=128, help='hidden dimension for query refinement')
     parser.add_argument('--refine_num_heads', type=int, default=4, help='attention heads for query refinement')
     parser.add_argument('--refine_dropout', type=float, default=0.0, help='dropout for query refinement')
-    parser.add_argument('--refine_residual_scale', type=float, default=0.9, help='scale of refinement residual logits')
+    parser.add_argument('--refine_residual_scale', type=float, default=0.7, help='scale of refinement residual logits')
     parser.add_argument('--refine_rounds', type=int, default=1, help='number of repeated refinement residual applications')
     parser.add_argument('--refine_gate_enable', action='store_true', default=False, help='apply refinement residual only when confidence/margin improves')
     parser.add_argument('--refine_gate_min_conf', type=float, default=0.30, help='minimum refined confidence for gated changed predictions')
@@ -53,11 +55,19 @@ def parse_args():
     parser.add_argument('--refine_region_accept_gate', action='store_true', default=False, help='fallback to no-op region projection unless refined projected scores improve region confidence')
     parser.add_argument('--refine_region_accept_conf_gain', type=float, default=0.02, help='minimum region confidence gain for accepting refined projected scores')
     parser.add_argument('--refine_region_accept_entropy_gain', type=float, default=0.0, help='minimum entropy reduction for accepting refined projected scores')
+    parser.add_argument('--refine_point_accept_gate', action='store_true', default=False, help='fallback to no-op projection per point unless refined scores are more confident')
+    parser.add_argument('--refine_point_accept_conf_gain', type=float, default=0.05, help='minimum point confidence gain for accepting label-changing residual predictions')
+    parser.add_argument('--refine_point_accept_min_conf', type=float, default=0.50, help='minimum refined point confidence for accepting label-changing residual predictions')
+    parser.add_argument('--refine_point_accept_min_margin', type=float, default=0.10, help='minimum refined point probability margin for accepting label-changing residual predictions')
+    parser.add_argument('--refine_point_accept_entropy_gain', type=float, default=0.0, help='minimum point entropy reduction for accepting label-changing residual predictions')
     parser.add_argument('--refine_apply_all', action='store_true', default=True, help='apply refiner residual to all points instead of only query-selected masks')
+    parser.add_argument('--no_refine_apply_all', dest='refine_apply_all', action='store_false', help='apply refiner residual only to query-selected masks')
     parser.add_argument('--refine_region_project', action='store_true', default=True, help='project refined logits to GrowSP region-average predictions')
+    parser.add_argument('--no_refine_region_project', dest='refine_region_project', action='store_false', help='disable region-average projection after refinement')
     parser.add_argument('--refine_region_project_mode', type=str, default='confprob', choices=['logit', 'prob', 'confprob', 'feat', 'vote'], help='region projection aggregation used after refinement')
     parser.add_argument('--refine_region_branch', action='store_true', default=False, help='enable region-level residual branch in the refiner')
     parser.add_argument('--refine_split_project', action='store_true', default=True, help='force accepted split sub-regions to their self-supervised semantic targets')
+    parser.add_argument('--no_refine_split_project', dest='refine_split_project', action='store_false', help='disable accepted split target projection')
     parser.add_argument('--refine_split_project_logit', type=float, default=20.0, help='logit value used for split sub-region target projection')
     parser.add_argument('--refine_split_project_gate', action='store_true', default=False, help='only apply split projection when refined logits support the split target')
     parser.add_argument('--refine_split_project_gate_conf', type=float, default=0.18, help='minimum refined target probability for gated split projection')
@@ -74,6 +84,7 @@ def parse_args():
     parser.add_argument('--refine_semantic_reduce', type=str, default='max', choices=['max', 'mean', 'logsumexp'], help='primitive-to-semantic logit reduction')
     parser.add_argument('--refine_split_enable', action='store_true', default=False, help='use split-region queries for refinement')
     parser.add_argument('--refine_consistency_enable', action='store_true', default=True)
+    parser.add_argument('--no_refine_consistency_enable', dest='refine_consistency_enable', action='store_false')
     parser.add_argument('--consistency_min_region_points', type=int, default=20)
     parser.add_argument('--consistency_max_regions', type=int, default=40)
     parser.add_argument('--consistency_min_conf', type=float, default=0.35)
@@ -93,7 +104,16 @@ def parse_args():
     parser.add_argument('--split_feat_weight', type=float, default=0.25)
     parser.add_argument('--split_semantic_weight', type=float, default=1.0)
     parser.add_argument('--split_multi_proposal', action='store_true', default=False)
+    parser.add_argument('--split_selection_mode', type=str, default='score', choices=['score', 'random'])
+    parser.add_argument('--split_random_seed', type=int, default=0)
     return parser.parse_args()
+
+
+def parse_test_areas(test_area):
+    areas = [area.strip() for area in str(test_area).split(',') if area.strip()]
+    if not areas:
+        raise ValueError('test_area must contain at least one S3DIS area')
+    return areas
 
 
 def reduce_primitive_logits(primitive_logits, cluster_pred, semantic_class, mode='max'):
@@ -194,6 +214,32 @@ def apply_region_accept_gate(args, candidate_scores, no_op_scores, region):
     return candidate_scores, accepted
 
 
+def apply_point_accept_gate(args, candidate_scores, no_op_scores, apply_mask=None):
+    candidate_probs = F.softmax(candidate_scores, dim=1)
+    no_op_probs = F.softmax(no_op_scores, dim=1)
+    candidate_conf, candidate_pred = candidate_probs.max(dim=1)
+    no_op_conf, no_op_pred = no_op_probs.max(dim=1)
+    top2 = torch.topk(candidate_probs, k=2, dim=1).values
+    candidate_margin = top2[:, 0] - top2[:, 1]
+    candidate_entropy = -(candidate_probs * torch.log(candidate_probs.clamp_min(1e-6))).sum(dim=1)
+    no_op_entropy = -(no_op_probs * torch.log(no_op_probs.clamp_min(1e-6))).sum(dim=1)
+
+    same_pred = candidate_pred == no_op_pred
+    changed_accept = (
+        (candidate_conf >= no_op_conf + getattr(args, 'refine_point_accept_conf_gain', 0.05))
+        & (candidate_conf >= getattr(args, 'refine_point_accept_min_conf', 0.50))
+        & (candidate_margin >= getattr(args, 'refine_point_accept_min_margin', 0.10))
+        & (candidate_entropy <= no_op_entropy - getattr(args, 'refine_point_accept_entropy_gain', 0.0))
+    )
+    accepted = same_pred | changed_accept
+    if apply_mask is not None:
+        accepted = accepted & apply_mask.to(candidate_scores.device).bool()
+        accepted = accepted | (~apply_mask.to(candidate_scores.device).bool())
+    gated_scores = no_op_scores.clone()
+    gated_scores[accepted] = candidate_scores[accepted]
+    return gated_scores, accepted
+
+
 def eval_once(args, model, test_loader, classifier, primitive_classifier=None, cluster_pred=None, refiner=None, use_sp=False):
 
     all_preds, all_refined_preds, all_label = [], [], []
@@ -252,6 +298,8 @@ def eval_once(args, model, test_loader, classifier, primitive_classifier=None, c
                         feat_weight=getattr(args, 'split_feat_weight', 0.25),
                         semantic_weight=getattr(args, 'split_semantic_weight', 1.0),
                         multi_proposal=getattr(args, 'split_multi_proposal', False),
+                        selection_mode=getattr(args, 'split_selection_mode', 'score'),
+                        random_seed=getattr(args, 'split_random_seed', 0),
                     )
                     if getattr(args, 'refine_consistency_enable', False):
                         (
@@ -313,7 +361,7 @@ def eval_once(args, model, test_loader, classifier, primitive_classifier=None, c
                     consistency_regions = 0
                 scores = base_scores.clone()
                 no_op_scores = None
-                if getattr(args, 'refine_region_accept_gate', False):
+                if getattr(args, 'refine_region_accept_gate', False) or getattr(args, 'refine_point_accept_gate', False):
                     no_op_scores = apply_refinement_projection(
                         args,
                         base_scores.clone(),
@@ -364,8 +412,12 @@ def eval_once(args, model, test_loader, classifier, primitive_classifier=None, c
                     split_targets if getattr(args, 'refine_split_enable', False) else None,
                 )
                 if no_op_scores is not None:
-                    scores, accepted_mask = apply_region_accept_gate(args, scores, no_op_scores, region)
-                    stats["accepted_points"] = stats.get("accepted_points", 0) + int(accepted_mask.sum().item())
+                    if getattr(args, 'refine_point_accept_gate', False):
+                        scores, accepted_mask = apply_point_accept_gate(args, scores, no_op_scores, apply_mask)
+                        stats["point_accepted_points"] = stats.get("point_accepted_points", 0) + int(accepted_mask.sum().item())
+                    if getattr(args, 'refine_region_accept_gate', False):
+                        scores, accepted_mask = apply_region_accept_gate(args, scores, no_op_scores, region)
+                        stats["accepted_points"] = stats.get("accepted_points", 0) + int(accepted_mask.sum().item())
                 preds = torch.argmax(scores, dim=1).cpu()
                 trusted_mask_cpu = apply_mask.cpu()
                 changed = preds != base_preds
@@ -522,7 +574,7 @@ if __name__ == '__main__':
     epoch = args.eval_epoch
     if epoch.isdigit():
         epoch = int(epoch)
-    o_Acc, m_Acc, s = eval(epoch, args)
+    o_Acc, m_Acc, s = eval(epoch, args, parse_test_areas(args.test_area))
     print('Epoch: {}, oAcc {:.2f}  mAcc {:.2f} IoUs'.format(epoch, o_Acc, m_Acc), s)
     stats = getattr(args, 'eval_refine_stats', None)
     if stats and args.refine_enable:

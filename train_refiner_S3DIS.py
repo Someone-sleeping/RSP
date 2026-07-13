@@ -33,6 +33,7 @@ def parse_args():
     parser.add_argument("--pseudo_label_path", type=str, default="")
     parser.add_argument("--teacher_ckpt_dir", type=str, required=True)
     parser.add_argument("--teacher_epoch", type=int, default=-1)
+    parser.add_argument("--test_area", type=str, default="Area_5", help="S3DIS held-out area, or comma-separated areas")
     parser.add_argument("--teacher_growsp", type=int, default=20)
     parser.add_argument("--target_teacher_ckpt_dir", type=str, default="")
     parser.add_argument("--target_teacher_epoch", type=int, default=-1)
@@ -64,20 +65,31 @@ def parse_args():
     parser.add_argument("--eval_interval", type=int, default=1)
     parser.add_argument("--save_interval", type=int, default=1)
 
-    parser.add_argument("--refine_lr", type=float, default=2e-4)
+    parser.add_argument("--refine_lr", type=float, default=1.5e-4)
     parser.add_argument("--refine_weight_decay", type=float, default=1e-4)
     parser.add_argument("--refine_hidden_dim", type=int, default=128)
     parser.add_argument("--refine_num_heads", type=int, default=4)
     parser.add_argument("--refine_dropout", type=float, default=0.0)
-    parser.add_argument("--refine_residual_scale", type=float, default=0.9)
+    parser.add_argument("--refine_residual_scale", type=float, default=0.7)
     parser.add_argument("--refine_rounds", type=int, default=1)
     parser.add_argument("--refine_query_scale", type=float, default=10.0)
     parser.add_argument("--refine_apply_all", action="store_true", default=True)
+    parser.add_argument("--no_refine_apply_all", dest="refine_apply_all", action="store_false")
     parser.add_argument("--refine_region_project", action="store_true", default=True)
+    parser.add_argument("--no_refine_region_project", dest="refine_region_project", action="store_false")
     parser.add_argument("--refine_region_project_mode", type=str, default="confprob", choices=["logit", "prob", "confprob", "feat", "vote"])
     parser.add_argument("--refine_region_branch", action="store_true", default=False)
     parser.add_argument("--refine_split_project", action="store_true", default=True)
+    parser.add_argument("--no_refine_split_project", dest="refine_split_project", action="store_false")
     parser.add_argument("--refine_split_project_logit", type=float, default=20.0)
+    parser.add_argument("--refine_point_accept_gate", action="store_true", default=False)
+    parser.add_argument("--refine_point_accept_conf_gain", type=float, default=0.05)
+    parser.add_argument("--refine_point_accept_min_conf", type=float, default=0.50)
+    parser.add_argument("--refine_point_accept_min_margin", type=float, default=0.10)
+    parser.add_argument("--refine_point_accept_entropy_gain", type=float, default=0.0)
+    parser.add_argument("--refine_region_accept_gate", action="store_true", default=False)
+    parser.add_argument("--refine_region_accept_conf_gain", type=float, default=0.02)
+    parser.add_argument("--refine_region_accept_entropy_gain", type=float, default=0.0)
     parser.add_argument("--refine_conf_th", type=float, default=0.55)
     parser.add_argument("--refine_margin_th", type=float, default=0.05)
     parser.add_argument("--refine_region_purity_th", type=float, default=0.75)
@@ -89,11 +101,23 @@ def parse_args():
     parser.add_argument("--consensus_conf_th", type=float, default=0.15)
     parser.add_argument("--consensus_temp", type=float, default=0.7)
     parser.add_argument("--refine_ce_lambda", type=float, default=1.0)
-    parser.add_argument("--refine_project_ce_lambda", type=float, default=0.0)
+    parser.add_argument("--refine_project_ce_lambda", type=float, default=0.2)
     parser.add_argument("--refine_accept_lambda", type=float, default=0.0)
     parser.add_argument("--refine_accept_gain", type=float, default=0.02)
+    parser.add_argument("--refine_noop_kl_lambda", type=float, default=0.0)
+    parser.add_argument("--refine_noop_kl_conf", type=float, default=0.75)
     parser.add_argument("--refine_pseudo_lambda", type=float, default=1.0)
     parser.add_argument("--refine_pseudo_conf", type=float, default=0.55)
+    parser.add_argument(
+        "--refine_optimize_mode",
+        type=str,
+        default="flip",
+        choices=["flip", "trusted", "split", "split_or_multi"],
+        help="which self-supervised targets are allowed to train residual updates",
+    )
+    parser.add_argument("--refine_optimize_min_conf", type=float, default=0.0)
+    parser.add_argument("--refine_optimize_split_min_conf", type=float, default=0.0)
+    parser.add_argument("--refine_optimize_min_support", type=int, default=2)
     parser.add_argument("--refine_margin_lambda", type=float, default=1.0)
     parser.add_argument("--refine_target_margin", type=float, default=0.3)
     parser.add_argument("--refine_keep_lambda", type=float, default=1.0)
@@ -108,7 +132,9 @@ def parse_args():
     parser.add_argument("--temporal_logit_scale", type=float, default=10.0)
     parser.add_argument("--temporal_align_mode", type=str, default="center", choices=["center", "batch"])
     parser.add_argument("--refine_split_enable", action="store_true", default=True)
+    parser.add_argument("--no_refine_split_enable", dest="refine_split_enable", action="store_false")
     parser.add_argument("--refine_consistency_enable", action="store_true", default=True)
+    parser.add_argument("--no_refine_consistency_enable", dest="refine_consistency_enable", action="store_false")
     parser.add_argument("--consistency_min_region_points", type=int, default=20)
     parser.add_argument("--consistency_max_regions", type=int, default=40)
     parser.add_argument("--consistency_min_conf", type=float, default=0.35)
@@ -128,7 +154,16 @@ def parse_args():
     parser.add_argument("--split_feat_weight", type=float, default=0.25)
     parser.add_argument("--split_semantic_weight", type=float, default=1.0)
     parser.add_argument("--split_multi_proposal", action="store_true", default=False)
+    parser.add_argument("--split_selection_mode", type=str, default="score", choices=["score", "random"])
+    parser.add_argument("--split_random_seed", type=int, default=0)
     return parser.parse_args()
+
+
+def parse_test_areas(test_area):
+    areas = [area.strip() for area in str(test_area).split(",") if area.strip()]
+    if not areas:
+        raise ValueError("test_area must contain at least one S3DIS area")
+    return areas
 
 
 def set_seed(seed):
@@ -519,6 +554,8 @@ def train_one_epoch(
                 feat_weight=args.split_feat_weight,
                 semantic_weight=args.split_semantic_weight,
                 multi_proposal=args.split_multi_proposal,
+                selection_mode=args.split_selection_mode,
+                random_seed=args.split_random_seed,
             )
             query_stats = {
                 "num_queries": split_stats["split_queries"],
@@ -601,11 +638,17 @@ def train_one_epoch(
         consensus_targets = torch.full((base_logits.size(0),), -1, dtype=torch.long, device=base_logits.device)
         target_conf = base_logits.new_zeros((base_logits.size(0),))
         target_weight = base_logits.new_zeros((base_logits.size(0),))
+        split_support_mask = torch.zeros((base_logits.size(0),), dtype=torch.bool, device=base_logits.device)
+        temporal_support_mask = torch.zeros((base_logits.size(0),), dtype=torch.bool, device=base_logits.device)
+        consistency_support_mask = torch.zeros((base_logits.size(0),), dtype=torch.bool, device=base_logits.device)
+        region_support_mask = torch.zeros((base_logits.size(0),), dtype=torch.bool, device=base_logits.device)
+        temporal_targets = torch.full((base_logits.size(0),), -1, dtype=torch.long, device=base_logits.device)
         if split_targets is not None and (split_targets >= 0).any():
             valid_split = split_targets >= 0
             consensus_targets[valid_split] = split_targets[valid_split]
             target_conf[valid_split] = split_target_conf[valid_split]
             target_weight[valid_split] = args.split_target_weight
+            split_support_mask = valid_split
         if target_logits is not None:
             temporal_probs = F.softmax(target_logits.detach() * args.temporal_logit_scale, dim=1)
             temporal_conf, temporal_targets = temporal_probs.max(dim=1)
@@ -617,6 +660,7 @@ def train_one_epoch(
             consensus_targets[valid_temporal] = temporal_targets[valid_temporal]
             target_conf[valid_temporal] = temporal_conf[valid_temporal]
             target_weight[valid_temporal] = args.temporal_target_weight
+            temporal_support_mask = temporal_conf >= args.temporal_target_conf
         if consistency_targets is not None and (consistency_targets >= 0).any():
             valid_consistency = (
                 (consistency_targets >= 0)
@@ -626,6 +670,7 @@ def train_one_epoch(
             consensus_targets[valid_consistency] = consistency_targets[valid_consistency]
             target_conf[valid_consistency] = consistency_target_conf[valid_consistency]
             target_weight[valid_consistency] = args.consistency_target_weight
+            consistency_support_mask = (consistency_targets >= 0) & (consistency_target_conf >= args.consistency_train_conf)
         region_targets, region_target_conf = region_consensus_targets(
             base_logits,
             point_regions,
@@ -638,9 +683,32 @@ def train_one_epoch(
         consensus_targets[missing_targets] = region_targets[missing_targets]
         target_conf[missing_targets] = region_target_conf[missing_targets]
         target_weight[missing_targets] = args.region_target_weight
+        region_support_mask = region_targets >= 0
         consensus_mask = (consensus_targets >= 0) & (target_weight > 0)
         flip_mask = consensus_mask & (consensus_targets != base_pseudo)
-        optimize_mask = flip_mask if flip_mask.any() else consensus_mask
+        support_count = torch.zeros((base_logits.size(0),), dtype=torch.long, device=base_logits.device)
+        if split_targets is not None:
+            support_count += (split_support_mask & (split_targets == consensus_targets)).long()
+        support_count += (temporal_support_mask & (temporal_targets == consensus_targets)).long()
+        if consistency_targets is not None:
+            support_count += (consistency_support_mask & (consistency_targets == consensus_targets)).long()
+        support_count += (region_support_mask & (region_targets == consensus_targets)).long()
+        if args.refine_optimize_mode == "trusted":
+            candidate_optimize_mask = flip_mask & (target_conf >= args.refine_optimize_min_conf)
+        elif args.refine_optimize_mode == "split":
+            candidate_optimize_mask = flip_mask & split_support_mask & (target_conf >= args.refine_optimize_split_min_conf)
+        elif args.refine_optimize_mode == "split_or_multi":
+            split_ok = split_support_mask & (target_conf >= args.refine_optimize_split_min_conf)
+            multi_ok = (support_count >= args.refine_optimize_min_support) & (target_conf >= args.refine_optimize_min_conf)
+            candidate_optimize_mask = flip_mask & (split_ok | multi_ok)
+        else:
+            candidate_optimize_mask = flip_mask
+        if candidate_optimize_mask.any():
+            optimize_mask = candidate_optimize_mask
+        elif args.refine_optimize_mode == "flip":
+            optimize_mask = consensus_mask
+        else:
+            optimize_mask = torch.zeros_like(consensus_mask)
         keep_mask = keep_mask | (consensus_mask & ~optimize_mask)
 
         projected_logits = region_project_logits(
@@ -687,6 +755,12 @@ def train_one_epoch(
                 loss_accept = refined_logits.sum() * 0.0
         else:
             loss_accept = refined_logits.sum() * 0.0
+        if args.refine_noop_kl_lambda > 0:
+            allow_change_mask = optimize_mask & (target_conf >= args.refine_noop_kl_conf)
+            noop_kl_mask = (refine_mask | keep_mask | consensus_mask) & ~allow_change_mask
+            loss_noop_kl = refinement_keep_kl(projected_logits, no_op_projected_logits.detach(), noop_kl_mask)
+        else:
+            loss_noop_kl = refined_logits.sum() * 0.0
 
         if primitive_pseudo.numel() == base_logits.size(0):
             pseudo_valid = (primitive_pseudo >= 0) & (primitive_pseudo < semantic_cluster_map.numel())
@@ -715,6 +789,7 @@ def train_one_epoch(
             args.refine_ce_lambda * loss_ce
             + args.refine_project_ce_lambda * loss_project_ce
             + args.refine_accept_lambda * loss_accept
+            + args.refine_noop_kl_lambda * loss_noop_kl
             + args.refine_pseudo_lambda * loss_pseudo
             + args.refine_margin_lambda * loss_margin
             + args.refine_keep_lambda * loss_keep
@@ -735,6 +810,7 @@ def train_one_epoch(
                 "loss_ce": loss_ce.item(),
                 "loss_project_ce": loss_project_ce.item(),
                 "loss_accept": loss_accept.item(),
+                "loss_noop_kl": loss_noop_kl.item(),
                 "loss_pseudo": loss_pseudo.item(),
                 "loss_keep": loss_keep.item(),
                 "loss_margin": loss_margin.item(),
@@ -751,6 +827,7 @@ def train_one_epoch(
                 "consensus_ratio": float(consensus_mask.float().mean().item()),
                 "flip_ratio": float(flip_mask.float().mean().item()),
                 "optimize_ratio": float(optimize_mask.float().mean().item()),
+                "support_ratio": float((support_count >= args.refine_optimize_min_support).float().mean().item()),
                 "pseudo_ratio": float(pseudo_mask.float().mean().item()),
                 "changed_all": float(changed.float().mean().item()),
                 "changed_refine": float(changed_within_refine.item()),
@@ -762,8 +839,8 @@ def train_one_epoch(
             denom = float(args.log_interval)
             logger.info(
                 "Epoch {:03d} [{:04d}/{:04d}] "
-                "loss {:.4f} ce {:.4f} pce {:.4f} accept {:.4f} pseudo {:.4f} margin {:.4f} keep {:.4f} delta {:.4f} entropy {:.4f} "
-                "refine {:.2f}% keep {:.2f}% consensus {:.2f}% flip {:.2f}% opt {:.2f}% pseudo {:.2f}% changed {:.2f}% changed@refine {:.2f}% "
+                "loss {:.4f} ce {:.4f} pce {:.4f} accept {:.4f} noopkl {:.4f} pseudo {:.4f} margin {:.4f} keep {:.4f} delta {:.4f} entropy {:.4f} "
+                "refine {:.2f}% keep {:.2f}% consensus {:.2f}% flip {:.2f}% opt {:.2f}% support {:.2f}% pseudo {:.2f}% changed {:.2f}% changed@refine {:.2f}% "
                 "queries {:.1f} fallback {:.1f} split {:.1f}/{:.1f} consistency {:.1f}/{:.1f}".format(
                     epoch,
                     batch_idx + 1,
@@ -772,6 +849,7 @@ def train_one_epoch(
                     meters["loss_ce"] / denom,
                     meters["loss_project_ce"] / denom,
                     meters["loss_accept"] / denom,
+                    meters["loss_noop_kl"] / denom,
                     meters["loss_pseudo"] / denom,
                     meters["loss_margin"] / denom,
                     meters["loss_keep"] / denom,
@@ -782,6 +860,7 @@ def train_one_epoch(
                     100 * meters["consensus_ratio"] / denom,
                     100 * meters["flip_ratio"] / denom,
                     100 * meters["optimize_ratio"] / denom,
+                    100 * meters["support_ratio"] / denom,
                     100 * meters["pseudo_ratio"] / denom,
                     100 * meters["changed_all"] / denom,
                     100 * meters["changed_refine"] / denom,
@@ -850,7 +929,10 @@ def main():
         logger.info(f"{key:<{max_key_len}} : {value}")
 
     all_areas = ["Area_1", "Area_2", "Area_3", "Area_4", "Area_5", "Area_6"]
-    test_areas = ["Area_5"]
+    test_areas = parse_test_areas(args.test_area)
+    unknown_areas = sorted(set(test_areas) - set(all_areas))
+    if unknown_areas:
+        raise ValueError("Unknown S3DIS test_area values: {}".format(", ".join(unknown_areas)))
     training_areas = sorted(list(set(all_areas) - set(test_areas)))
 
     model, primitive_classifier, teacher_epoch = load_teacher(args, logger)

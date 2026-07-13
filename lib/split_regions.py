@@ -74,6 +74,8 @@ def build_split_region_queries(
     feat_weight=0.25,
     semantic_weight=1.0,
     multi_proposal=False,
+    selection_mode="score",
+    random_seed=0,
 ):
     """Split suspect GrowSP regions into semantic sub-regions.
 
@@ -131,7 +133,13 @@ def build_split_region_queries(
             candidate_regions += 1
             candidates.append((float(score.item()), mask))
 
-        candidates.sort(key=lambda item: item[0], reverse=True)
+        if selection_mode == "random" and len(candidates) > 0:
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(int(random_seed) + int(batch_id.item()))
+            order = torch.randperm(len(candidates), generator=generator).tolist()
+            candidates = [candidates[idx] for idx in order]
+        else:
+            candidates.sort(key=lambda item: item[0], reverse=True)
         for _, mask in candidates[:max_split_regions_per_scene]:
             local_indices = torch.nonzero(mask, as_tuple=False).flatten()
             proposals = [(xyz_weight, rgb_weight, feat_weight, semantic_weight)]

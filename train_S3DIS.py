@@ -37,8 +37,10 @@ def parse_args():
                         help='initial superpoint path')
     parser.add_argument('--save_path', type=str, default='ckpt/S3DIS/',
                         help='model savepath')
+    parser.add_argument('--test_area', type=str, default='Area_5',
+                        help='S3DIS held-out area, or comma-separated areas')
     ###
-    parser.add_argument('--max_epoch', type=list, default=[500, 800], help='max epoch for non-growing and growing stage')
+    parser.add_argument('--max_epoch', type=int, nargs=2, default=[500, 800], help='max epoch for non-growing and growing stage')
     parser.add_argument('--max_iter', type=int, nargs='+', default=[10000, 30000], help='max iter for non-growing and growing stage')
     ###
     parser.add_argument('--bn_momentum', type=float, default=0.02, help='batchnorm parameters')
@@ -103,6 +105,13 @@ def parse_args():
     return parser.parse_args()
 
 
+def parse_test_areas(test_area):
+    areas = [area.strip() for area in str(test_area).split(',') if area.strip()]
+    if not areas:
+        raise ValueError('test_area must contain at least one S3DIS area')
+    return areas
+
+
 def main(args, logger):
     if args.refine_teacher_ckpt_dir:
         args.refine_enable = True
@@ -123,8 +132,12 @@ def main(args, logger):
     logger.info("------------------------------")
     backup_selected(args)
     all_areas = ['Area_1', 'Area_2', 'Area_3', 'Area_4', 'Area_5', 'Area_6']
-    test_areas = ['Area_5']
+    test_areas = parse_test_areas(args.test_area)
+    unknown_areas = sorted(set(test_areas) - set(all_areas))
+    if unknown_areas:
+        raise ValueError('Unknown S3DIS test_area values: {}'.format(', '.join(unknown_areas)))
     training_areas = sorted(list(set(all_areas) - set(test_areas)))
+    logger.info(f"Test Areas: {test_areas}")
     logger.info(f"Training Areas: {training_areas}")
 
     trainset = S3DIStrain(args, areas=training_areas)

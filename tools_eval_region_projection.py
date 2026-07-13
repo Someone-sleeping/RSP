@@ -1,3 +1,4 @@
+import argparse
 import os
 
 import MinkowskiEngine as ME
@@ -32,19 +33,54 @@ class Args:
     ignore_label = 12
 
 
+def parse_args():
+    parser = argparse.ArgumentParser("Evaluate projection and smoothing baselines on S3DIS")
+    parser.add_argument("--save_path", default="ckpt/S3DIS/refiner_projectloss02_e10/")
+    parser.add_argument("--eval_epoch", default="best", help='checkpoint epoch or "best"')
+    parser.add_argument("--test_area", default="Area_5", help="S3DIS held-out area, or comma-separated areas")
+    parser.add_argument("--data_path", default=Args.data_path)
+    parser.add_argument("--sp_path", default=Args.sp_path)
+    parser.add_argument("--workers", type=int, default=Args.workers)
+    parser.add_argument("--cluster_workers", type=int, default=Args.cluster_workers)
+    parser.add_argument("--seed", type=int, default=Args.seed)
+    parser.add_argument("--voxel_size", type=float, default=Args.voxel_size)
+    parser.add_argument("--input_dim", type=int, default=Args.input_dim)
+    parser.add_argument("--primitive_num", type=int, default=Args.primitive_num)
+    parser.add_argument("--semantic_class", type=int, default=Args.semantic_class)
+    parser.add_argument("--feats_dim", type=int, default=Args.feats_dim)
+    parser.add_argument("--ignore_label", type=int, default=Args.ignore_label)
+    parser.add_argument("--bn_momentum", type=float, default=Args.bn_momentum)
+    parser.add_argument("--conv1_kernel_size", type=int, default=Args.conv1_kernel_size)
+    return parser.parse_args(namespace=Args())
+
+
+def parse_test_areas(test_area):
+    areas = [area.strip() for area in str(test_area).split(",") if area.strip()]
+    if not areas:
+        raise ValueError("test_area must contain at least one S3DIS area")
+    return areas
+
+
+def checkpoint_paths(save_path, eval_epoch):
+    model_name = "model_best_checkpoint.pth" if str(eval_epoch) == "best" else f"model_{eval_epoch}_checkpoint.pth"
+    cls_name = "cls_best_checkpoint.pth" if str(eval_epoch) == "best" else f"cls_{eval_epoch}_checkpoint.pth"
+    return os.path.join(save_path, model_name), os.path.join(save_path, cls_name)
+
+
 def main():
-    args = Args()
+    args = parse_args()
     model = Res16FPN18(
         in_channels=args.input_dim,
         out_channels=args.primitive_num,
         conv1_kernel_size=args.conv1_kernel_size,
         config=args,
     ).cuda()
-    model.load_state_dict(torch.load(os.path.join(args.save_path, "model_best_checkpoint.pth")))
+    model_path, cls_path = checkpoint_paths(args.save_path, args.eval_epoch)
+    model.load_state_dict(torch.load(model_path))
     model.eval()
 
     cls = torch.nn.Linear(args.feats_dim, args.primitive_num, bias=False).cuda()
-    cls.load_state_dict(torch.load(os.path.join(args.save_path, "cls_best_checkpoint.pth")))
+    cls.load_state_dict(torch.load(cls_path))
     cls.eval()
 
     primitive_centers = cls.weight.data
@@ -61,7 +97,7 @@ def main():
     classifier.eval()
 
     loader = DataLoader(
-        S3DIStest(args, areas=["Area_5"]),
+        S3DIStest(args, areas=parse_test_areas(args.test_area)),
         batch_size=1,
         collate_fn=cfl_collate_fn_test(),
         num_workers=4,
@@ -69,13 +105,14 @@ def main():
     )
 
     split_configs = [
-        ("split_s1_m80_p92_e25", 1.0, 80, 0.92, 0.25, 0.15),
-        ("split_s3_m80_p92_e25", 3.0, 80, 0.92, 0.25, 0.15),
-        ("split_s10_m80_p92_e25", 10.0, 80, 0.92, 0.25, 0.15),
-        ("split_s10_m120_p92_e25", 10.0, 120, 0.92, 0.25, 0.15),
-        ("split_s10_m120_p95_e30", 10.0, 120, 0.95, 0.30, 0.15),
-        ("split_s10_m120_p98_e40", 10.0, 120, 0.98, 0.40, 0.10),
-        ("split_s5_m160_p95_e40", 5.0, 160, 0.95, 0.40, 0.10),
+        ("split_s1_m80_p92_e25", 1.0, 80, 0.92, 0.25, 0.15, "score"),
+        ("random_split_s1_m80_p92_e25", 1.0, 80, 0.92, 0.25, 0.15, "random"),
+        ("split_s3_m80_p92_e25", 3.0, 80, 0.92, 0.25, 0.15, "score"),
+        ("split_s10_m80_p92_e25", 10.0, 80, 0.92, 0.25, 0.15, "score"),
+        ("split_s10_m120_p92_e25", 10.0, 120, 0.92, 0.25, 0.15, "score"),
+        ("split_s10_m120_p95_e30", 10.0, 120, 0.95, 0.30, 0.15, "score"),
+        ("split_s10_m120_p98_e40", 10.0, 120, 0.98, 0.40, 0.10, "score"),
+        ("split_s5_m160_p95_e40", 5.0, 160, 0.95, 0.40, 0.10, "score"),
     ]
     base_region_names = [
         "region_logit",
@@ -84,7 +121,7 @@ def main():
         "region_feat",
         "region_vote",
     ]
-    strategy_names = ["base", "consistency"]
+    strategy_names = ["base", "graph_smooth", "consistency"]
     strategy_names.extend(base_region_names)
     for region_name in base_region_names:
         strategy_names.append("consistency_" + region_name)
@@ -123,7 +160,7 @@ def main():
             point_batch_ids = coords[:, 0].long().cuda()
             point_coords = coords[:, 1:].float().cuda()
             point_colors = features[:, :3].float().cuda()
-            for split_name, logit_scale, max_regions, purity_th, entropy_th, min_conf in split_configs:
+            for split_name, logit_scale, max_regions, purity_th, entropy_th, min_conf, selection_mode in split_configs:
                 split_pred = base.clone()
                 (
                     _split_queries,
@@ -149,6 +186,8 @@ def main():
                     rgb_weight=0.5,
                     feat_weight=0.25,
                     semantic_weight=1.0,
+                    selection_mode=selection_mode,
+                    random_seed=args.seed,
                 )
                 split_valid = (split_targets >= 0).cpu()
                 split_pred[split_valid] = split_targets.cpu()[split_valid]
@@ -207,6 +246,7 @@ def main():
                 smooth_preds = smooth_scores.argmax(dim=1)
                 for idx, region_id in enumerate(region_ids):
                     graph_projected[region == int(region_id)] = smooth_preds[idx]
+            all_preds["graph_smooth"].append(graph_projected[inverse_map.long()][labels != args.ignore_label])
 
             valid = labels != args.ignore_label
             all_labels.append(labels[valid])
