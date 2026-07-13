@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 
 from datasets.S3DIS import S3DIStest, cfl_collate_fn_test
 from eval_S3DIS import compute_unsupervised_metrics
+from lib.meta_optimizer import meta_optimize_poe_weight
 from lib.split_regions import build_region_consistency_queries, build_split_region_queries
 from models.fpn import Res16FPN18
 from models.query_refiner import ErrorQueryRefiner
@@ -44,6 +45,16 @@ def parse_args():
     parser.add_argument("--refiner_scale", type=float, default=1.0)
     parser.add_argument("--refiner_hidden_dim", type=int, default=128)
     parser.add_argument("--refiner_num_heads", type=int, default=4)
+    parser.add_argument("--blend_weights", default="0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9")
+    parser.add_argument("--meta_optimize", action="store_true", default=False)
+    parser.add_argument("--meta_initial_weight", type=float, default=0.1)
+    parser.add_argument("--meta_inner_steps", type=int, default=5)
+    parser.add_argument("--meta_inner_lr", type=float, default=0.5)
+    parser.add_argument("--meta_correction_weight", type=float, default=1.0)
+    parser.add_argument("--meta_keep_weight", type=float, default=1.0)
+    parser.add_argument("--meta_entropy_weight", type=float, default=0.01)
+    parser.add_argument("--meta_query_tolerance", type=float, default=0.0)
+    parser.add_argument("--meta_classwise", action="store_true", default=False)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--output_json", default="")
     return parser.parse_args()
@@ -254,6 +265,7 @@ def main():
     args = parse_args()
     reference_epochs = parse_int_list(args.reference_epochs)
     thresholds = parse_float_list(args.thresholds)
+    blend_weights = parse_float_list(args.blend_weights)
 
     base_model, base_centers = load_reference(args, args.base_epoch)
     temporal_references = []
@@ -285,6 +297,16 @@ def main():
     names.extend([f"epoch_{epoch}" for epoch in reference_epochs])
     if refiner is not None:
         names.extend(["split_noop", "split_refiner", "refiner_candidate_vote"])
+        if args.meta_optimize:
+            names.append("meta_scene_poe")
+        for blend_weight in blend_weights:
+            blend_suffix = int(round(100 * blend_weight))
+            names.extend(
+                [
+                    f"refiner_temporal_mix_w{blend_suffix}",
+                    f"refiner_temporal_poe_w{blend_suffix}",
+                ]
+            )
     for threshold in thresholds:
         suffix = int(round(100 * threshold))
         names.extend(
@@ -301,15 +323,27 @@ def main():
             names.extend(
                 [
                     f"refiner_temporal_override_t{suffix}",
+                    f"meta_init_poe_override_t{suffix}",
+                    f"meta_init_poe_region_t{suffix}",
                     f"refiner_override_region_t{suffix}",
                     f"refiner_compatible_union_t{suffix}",
                     f"residual_verified_t{suffix}",
                     f"refiner_verified_union_t{suffix}",
                 ]
             )
+            if args.meta_optimize:
+                names.append(f"meta_adapt_override_t{suffix}")
     all_predictions = {name: [] for name in names}
     all_labels = []
     proxy_sums = {"points": 0.0}
+    meta_stats = {
+        "scenes": 0,
+        "accepted_scenes": 0,
+        "selected_weight_sum": 0.0,
+        "adapted_weight_sum": 0.0,
+        "query_gain_sum": 0.0,
+        "correction_ratio_sum": 0.0,
+    }
 
     def add_proxy(name, value, weight):
         proxy_sums[name] = proxy_sums.get(name, 0.0) + float(value) * float(weight)
@@ -406,6 +440,7 @@ def main():
 
         no_op_pred = None
         refined_pred = None
+        meta_adapted_pred = None
         if refiner is not None:
             no_op_scores, refined_scores = run_split_refiner(
                 args,
@@ -441,6 +476,51 @@ def main():
             scene_predictions["split_noop"] = no_op_pred
             scene_predictions["split_refiner"] = refined_pred
             scene_predictions["refiner_candidate_vote"] = candidate_vote_pred
+            refined_probability = F.softmax(refined_scores, dim=1)
+            meta_initial_poe_score = (
+                (1.0 - args.meta_initial_weight) * torch.log(refined_probability.clamp_min(1e-6))
+                + args.meta_initial_weight * torch.log(temporal_mean_prob.clamp_min(1e-6))
+            )
+            meta_initial_poe_pred = meta_initial_poe_score.argmax(dim=1)
+            for blend_weight in blend_weights:
+                blend_suffix = int(round(100 * blend_weight))
+                mixed_probability = (
+                    (1.0 - blend_weight) * refined_probability
+                    + blend_weight * temporal_mean_prob
+                )
+                poe_score = (
+                    (1.0 - blend_weight) * torch.log(refined_probability.clamp_min(1e-6))
+                    + blend_weight * torch.log(temporal_mean_prob.clamp_min(1e-6))
+                )
+                scene_predictions[f"refiner_temporal_mix_w{blend_suffix}"] = mixed_probability.argmax(dim=1)
+                scene_predictions[f"refiner_temporal_poe_w{blend_suffix}"] = poe_score.argmax(dim=1)
+            if args.meta_optimize:
+                meta_probability, selected_weight, meta_accepted, scene_meta_stats = meta_optimize_poe_weight(
+                    refined_probability.detach(),
+                    temporal_mean_prob.detach(),
+                    temporal_votes.detach(),
+                    region_pred.detach(),
+                    no_op_pred.detach(),
+                    base_pred.detach(),
+                    initial_weight=args.meta_initial_weight,
+                    confidence_threshold=args.selection_threshold,
+                    min_votes=args.min_temporal_votes,
+                    inner_steps=args.meta_inner_steps,
+                    inner_lr=args.meta_inner_lr,
+                    correction_weight=args.meta_correction_weight,
+                    keep_weight=args.meta_keep_weight,
+                    entropy_weight=args.meta_entropy_weight,
+                    query_tolerance=args.meta_query_tolerance,
+                    classwise=args.meta_classwise,
+                )
+                scene_predictions["meta_scene_poe"] = meta_probability.argmax(dim=1)
+                meta_adapted_pred = scene_predictions["meta_scene_poe"]
+                meta_stats["scenes"] += 1
+                meta_stats["accepted_scenes"] += int(meta_accepted)
+                meta_stats["selected_weight_sum"] += float(selected_weight)
+                meta_stats["adapted_weight_sum"] += float(scene_meta_stats.get("adapted_weight", selected_weight))
+                meta_stats["query_gain_sum"] += float(scene_meta_stats.get("query_gain", 0.0))
+                meta_stats["correction_ratio_sum"] += float(scene_meta_stats.get("correction_ratio", 0.0))
         for threshold in thresholds:
             suffix = int(round(100 * threshold))
             point_accept = (
@@ -497,6 +577,17 @@ def main():
                 temporal_override = refined_pred.clone()
                 temporal_override[point_accept] = temporal_mean_pred[point_accept]
 
+                meta_init_override = meta_initial_poe_pred.clone()
+                meta_init_override[point_accept] = temporal_mean_pred[point_accept]
+
+                meta_init_region = meta_init_override.clone()
+                meta_region_completion = region_accept & ~point_accept & (
+                    (meta_init_override == base_pred)
+                    | (meta_init_override == region_pred)
+                    | (no_op_pred == region_pred)
+                )
+                meta_init_region[meta_region_completion] = region_pred[meta_region_completion]
+
                 override_region = temporal_override.clone()
                 region_completion = region_accept & ~point_accept & (
                     (refined_pred == base_pred)
@@ -535,10 +626,16 @@ def main():
                 verified_union[union_compatible] = point_region_union[union_compatible]
 
                 scene_predictions[f"refiner_temporal_override_t{suffix}"] = temporal_override
+                scene_predictions[f"meta_init_poe_override_t{suffix}"] = meta_init_override
+                scene_predictions[f"meta_init_poe_region_t{suffix}"] = meta_init_region
                 scene_predictions[f"refiner_override_region_t{suffix}"] = override_region
                 scene_predictions[f"refiner_compatible_union_t{suffix}"] = compatible_union
                 scene_predictions[f"residual_verified_t{suffix}"] = residual_verified
                 scene_predictions[f"refiner_verified_union_t{suffix}"] = verified_union
+                if meta_adapted_pred is not None:
+                    meta_adapt_override = meta_adapted_pred.clone()
+                    meta_adapt_override[point_accept] = temporal_mean_pred[point_accept]
+                    scene_predictions[f"meta_adapt_override_t{suffix}"] = meta_adapt_override
 
         valid = labels != args.ignore_label
         inverse = inverse_map.long().cuda()
@@ -593,7 +690,10 @@ def main():
     results["selected_independent"] = dict(results[selected_independent_strategy])
     results["selected_independent"]["strategy"] = selected_independent_strategy
     if refiner is not None:
-        joint_candidate = f"refiner_temporal_override_t{selected_suffix}"
+        if args.meta_optimize:
+            joint_candidate = f"meta_adapt_override_t{selected_suffix}"
+        else:
+            joint_candidate = f"meta_init_poe_override_t{selected_suffix}"
         selected_joint_strategy = joint_candidate if reliable_anchor_epochs else "split_refiner"
         results["selected_joint"] = dict(results[selected_joint_strategy])
         results["selected_joint"]["strategy"] = selected_joint_strategy
@@ -606,6 +706,19 @@ def main():
     }
     if refiner is not None:
         selection["joint_strategy"] = selected_joint_strategy
+    if args.meta_optimize and meta_stats["scenes"] > 0:
+        scene_count = float(meta_stats["scenes"])
+        meta_summary = {
+            "scenes": int(meta_stats["scenes"]),
+            "accepted_scenes": int(meta_stats["accepted_scenes"]),
+            "accept_ratio": meta_stats["accepted_scenes"] / scene_count,
+            "mean_selected_weight": meta_stats["selected_weight_sum"] / scene_count,
+            "mean_adapted_weight": meta_stats["adapted_weight_sum"] / scene_count,
+            "mean_query_gain": meta_stats["query_gain_sum"] / scene_count,
+            "mean_correction_ratio": meta_stats["correction_ratio_sum"] / scene_count,
+        }
+    else:
+        meta_summary = {}
 
     for name, result in sorted(results.items(), key=lambda item: item[1]["mIoU"], reverse=True):
         print(
@@ -614,6 +727,8 @@ def main():
         )
     print("label_free_proxies", json.dumps(proxies, sort_keys=True))
     print("label_free_selection", json.dumps(selection, sort_keys=True))
+    if meta_summary:
+        print("meta_optimizer", json.dumps(meta_summary, sort_keys=True))
     if args.output_json:
         output_dir = os.path.dirname(args.output_json)
         if output_dir:
@@ -627,6 +742,7 @@ def main():
                     "results": results,
                     "label_free_proxies": proxies,
                     "label_free_selection": selection,
+                    "meta_optimizer": meta_summary,
                 },
                 output_file,
                 indent=2,
