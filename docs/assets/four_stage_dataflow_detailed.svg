@@ -1,0 +1,269 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1600" viewBox="0 0 2400 1600" role="img" aria-labelledby="title desc">
+  <title id="title">Detailed tensor flow of the four-stage GrowSP correction pipeline</title>
+  <desc id="desc">The diagram exposes the inputs, internal operations, masks, and outputs of superpoint splitting, error-query refinement, episodic meta adaptation, and error verification.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L11 5.5 L0 11 Z" fill="#344054"/>
+    </marker>
+    <marker id="arrow-purple" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L11 5.5 L0 11 Z" fill="#6941c6"/>
+    </marker>
+    <marker id="arrow-red" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L11 5.5 L0 11 Z" fill="#b42318"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#101828" flood-opacity="0.09"/>
+    </filter>
+    <style>
+      text { font-family: "DejaVu Sans"; letter-spacing: 0; }
+      .title { font-size: 34px; font-weight: 700; fill: #101828; }
+      .subtitle { font-size: 18px; font-weight: 400; fill: #475467; }
+      .legend { font-size: 15px; font-weight: 500; fill: #475467; }
+      .source-title { font-size: 23px; font-weight: 700; fill: #101828; }
+      .source-text { font-size: 17px; font-weight: 400; fill: #344054; }
+      .stage-title { font-size: 24px; font-weight: 700; fill: #101828; }
+      .section { font-size: 15px; font-weight: 700; fill: #475467; }
+      .op-title { font-size: 19px; font-weight: 700; fill: #101828; }
+      .body { font-size: 16px; font-weight: 400; fill: #344054; }
+      .equation { font-size: 15px; font-weight: 500; fill: #101828; }
+      .note { font-size: 14px; font-weight: 400; fill: #475467; }
+      .output { font-size: 16px; font-weight: 700; fill: #101828; }
+      .badge { font-size: 19px; font-weight: 700; fill: #ffffff; text-anchor: middle; dominant-baseline: middle; }
+      .flow { fill: none; stroke: #344054; stroke-width: 3; marker-end: url(#arrow); }
+      .inner { fill: none; stroke: #667085; stroke-width: 2.3; marker-end: url(#arrow); }
+      .train { fill: none; stroke: #6941c6; stroke-width: 2.5; stroke-dasharray: 9 7; marker-end: url(#arrow-purple); }
+      .label-flow { fill: none; stroke: #b42318; stroke-width: 2.5; stroke-dasharray: 9 7; marker-end: url(#arrow-red); }
+    </style>
+  </defs>
+
+  <rect width="2400" height="1600" fill="#f8fafc"/>
+  <text class="title" x="48" y="55">Detailed Data Flow: Error-Guided Optimization of Frozen GrowSP</text>
+  <text class="subtitle" x="48" y="88">Every stage exposes its tensors, internal operators, decision masks, and outputs.</text>
+  <path d="M50 119 H112" stroke="#344054" stroke-width="3" marker-end="url(#arrow)"/>
+  <text class="legend" x="125" y="124">inference data</text>
+  <path d="M275 119 H337" stroke="#6941c6" stroke-width="2.5" stroke-dasharray="9 7" marker-end="url(#arrow-purple)"/>
+  <text class="legend" x="350" y="124">training / meta outer loop</text>
+  <path d="M590 119 H652" stroke="#b42318" stroke-width="2.5" stroke-dasharray="9 7" marker-end="url(#arrow-red)"/>
+  <text class="legend" x="665" y="124">ground truth: evaluation only</text>
+
+  <!-- Frozen sources -->
+  <g filter="url(#shadow)">
+    <rect x="40" y="155" width="1135" height="175" rx="8" fill="#ffffff" stroke="#6172f3" stroke-width="2"/>
+    <rect x="1225" y="155" width="1135" height="175" rx="8" fill="#ffffff" stroke="#667085" stroke-width="2"/>
+  </g>
+  <rect x="40" y="155" width="1135" height="45" rx="8" fill="#eef4ff"/>
+  <rect x="1225" y="155" width="1135" height="45" rx="8" fill="#f2f4f7"/>
+  <text class="source-title" x="70" y="188">Current frozen GrowSP</text>
+  <text class="source-title" x="1255" y="188">Aligned frozen historical checkpoints</text>
+  <text class="source-text" x="70" y="232">3D points (X, RGB) + initial superpoints R</text>
+  <text class="source-text" x="70" y="264">Backbone → normalized feature F; semantic centers → base logits Z₀ and prediction y₀</text>
+  <rect x="70" y="285" width="250" height="30" rx="5" fill="#eef4ff" stroke="#b2ccff"/>
+  <rect x="335" y="285" width="275" height="30" rx="5" fill="#eef4ff" stroke="#b2ccff"/>
+  <rect x="625" y="285" width="230" height="30" rx="5" fill="#eef4ff" stroke="#b2ccff"/>
+  <rect x="870" y="285" width="270" height="30" rx="5" fill="#eef4ff" stroke="#b2ccff"/>
+  <text class="equation" x="90" y="306">F ∈ ℝᴺˣᴰ</text>
+  <text class="equation" x="355" y="306">Z₀ ∈ ℝᴺˣᶜ</text>
+  <text class="equation" x="645" y="306">P₀ = softmax(Z₀)</text>
+  <text class="equation" x="890" y="306">yᴿ = region-project(P₀,R)</text>
+
+  <text class="source-text" x="1255" y="232">Center alignment → per-checkpoint probabilities {Pᵗ(k)} and predictions {yᵗ(k)}</text>
+  <text class="source-text" x="1255" y="264">Temporal aggregation → mean probability, target, confidence, and vote support</text>
+  <rect x="1255" y="285" width="250" height="30" rx="5" fill="#f2f4f7" stroke="#d0d5dd"/>
+  <rect x="1520" y="285" width="250" height="30" rx="5" fill="#f2f4f7" stroke="#d0d5dd"/>
+  <rect x="1785" y="285" width="250" height="30" rx="5" fill="#f2f4f7" stroke="#d0d5dd"/>
+  <rect x="2050" y="285" width="275" height="30" rx="5" fill="#f2f4f7" stroke="#d0d5dd"/>
+  <text class="equation" x="1275" y="306">Pᵗ = meanₖ Pᵗ(k)</text>
+  <text class="equation" x="1540" y="306">yᵗ = argmax Pᵗ</text>
+  <text class="equation" x="1805" y="306">cᵗ = max Pᵗ</text>
+  <text class="equation" x="2070" y="306">vᵗ = checkpoint votes</text>
+
+  <!-- Stage cards -->
+  <g filter="url(#shadow)">
+    <rect x="40" y="390" width="550" height="900" rx="8" fill="#ffffff" stroke="#f79009" stroke-width="2.5"/>
+    <rect x="630" y="390" width="550" height="900" rx="8" fill="#ffffff" stroke="#6172f3" stroke-width="2.5"/>
+    <rect x="1220" y="390" width="550" height="900" rx="8" fill="#ffffff" stroke="#7f56d9" stroke-width="2.5"/>
+    <rect x="1810" y="390" width="550" height="900" rx="8" fill="#ffffff" stroke="#f04438" stroke-width="2.5"/>
+  </g>
+
+  <!-- Stage 1 header/input -->
+  <rect x="40" y="390" width="550" height="72" rx="8" fill="#fff7ed"/>
+  <circle cx="78" cy="426" r="22" fill="#f79009"/>
+  <text class="badge" x="78" y="426">1</text>
+  <text class="stage-title" x="112" y="434">Error-Guided Superpoint Split</text>
+  <text class="section" x="68" y="498">INPUTS</text>
+  <rect x="68" y="512" width="494" height="70" rx="6" fill="#fffaeb" stroke="#fedf89"/>
+  <text class="equation" x="88" y="539">Z₀, P₀, F, X, RGB, superpoint IDs R</text>
+  <text class="note" x="88" y="565">All signals come from the frozen model and geometry.</text>
+
+  <rect x="68" y="615" width="494" height="112" rx="6" fill="#fff7ed" stroke="#fed7aa"/>
+  <text class="op-title" x="88" y="645">1a. Detect suspect regions</text>
+  <text class="equation" x="88" y="674">Hᵢ = entropy(P₀ᵢ),  purity(Rⱼ) = max-class ratio</text>
+  <text class="body" x="88" y="703">suspect if purity &lt; 0.92 or mean entropy ≥ 0.25</text>
+
+  <path class="inner" d="M315 727 V752"/>
+  <rect x="68" y="752" width="494" height="176" rx="6" fill="#fff7ed" stroke="#fed7aa"/>
+  <text class="op-title" x="88" y="782">1b. Split each suspect superpoint</text>
+  <text class="equation" x="88" y="811">φᵢ = [norm(Xᵢ), norm(RGBᵢ), norm(Fᵢ), P₀ᵢ]</text>
+  <text class="body" x="88" y="840">two-means(φ) → child masks S₀, S₁</text>
+  <text class="equation" x="88" y="869">tₖ = argmax meanᵢ∈Sₖ P₀ᵢ</text>
+  <text class="body" x="88" y="898">keep split only if size/confidence pass and t₀ ≠ t₁</text>
+
+  <path class="inner" d="M315 928 V953"/>
+  <rect x="68" y="953" width="494" height="113" rx="6" fill="#fff7ed" stroke="#fed7aa"/>
+  <text class="op-title" x="88" y="983">1c. Build error queries</text>
+  <text class="body" x="88" y="1012">Q: highest-entropy point in each accepted child</text>
+  <text class="body" x="88" y="1041">Add consistency queries for noisy points in coherent R</text>
+
+  <text class="section" x="68" y="1102">OUTPUTS</text>
+  <rect x="68" y="1116" width="494" height="135" rx="6" fill="#ecfdf3" stroke="#6ce9a6"/>
+  <text class="output" x="88" y="1145">Q, split targets Tˢ, refine/keep masks</text>
+  <text class="equation" x="88" y="1175">Zⁿᵒᵒᵖ = Project(Z₀ | R, Tˢ)</text>
+  <text class="note" x="88" y="1204">Project region consensus, then hard-assign valid split</text>
+  <text class="note" x="88" y="1230">children to their label-free semantic target.</text>
+
+  <!-- Stage 2 -->
+  <rect x="630" y="390" width="550" height="72" rx="8" fill="#eef4ff"/>
+  <circle cx="668" cy="426" r="22" fill="#6172f3"/>
+  <text class="badge" x="668" y="426">2</text>
+  <text class="stage-title" x="702" y="434">Error-Query Refiner</text>
+  <text class="section" x="658" y="498">INPUTS</text>
+  <rect x="658" y="512" width="494" height="70" rx="6" fill="#eef4ff" stroke="#b2ccff"/>
+  <text class="equation" x="678" y="539">F, X, Q, Z₀, R, Tˢ and residual scale s</text>
+  <text class="note" x="678" y="565">The GrowSP backbone remains frozen.</text>
+
+  <rect x="658" y="615" width="235" height="145" rx="6" fill="#eef4ff" stroke="#b2ccff"/>
+  <text class="op-title" x="678" y="645">Point branch</text>
+  <text class="equation" x="678" y="676">ΔZᵖ = MLP(F)</text>
+  <text class="body" x="678" y="706">Local correction prior</text>
+  <text class="note" x="678" y="735">initialized at zero</text>
+
+  <rect x="917" y="615" width="235" height="265" rx="6" fill="#eef4ff" stroke="#b2ccff"/>
+  <text class="op-title" x="937" y="645">Query branch</text>
+  <text class="equation" x="937" y="675">h = Proj(F)+Pos(X)</text>
+  <text class="body" x="937" y="707">Q → scene attention</text>
+  <text class="body" x="937" y="737">scene → Q attention</text>
+  <text class="body" x="937" y="767">FFN + LayerNorm</text>
+  <text class="equation" x="937" y="799">ΔZᑫ = OutProj(h)</text>
+  <text class="note" x="937" y="833">Queries collect global context</text>
+  <text class="note" x="937" y="858">and broadcast it to points.</text>
+
+  <path class="inner" d="M775 760 V905 H905"/>
+  <path class="inner" d="M1034 880 V905 H905"/>
+  <rect x="658" y="905" width="494" height="125" rx="6" fill="#eef4ff" stroke="#b2ccff"/>
+  <text class="op-title" x="678" y="935">Residual candidate generation</text>
+  <text class="equation" x="678" y="965">ΔZ = ΔZᵖ + ΔZᑫ</text>
+  <text class="equation" x="678" y="995">Zˢ = Project(Z₀ + sΔZ | R,Tˢ),  s ∈ S</text>
+  <text class="note" x="678" y="1020">Projection constrains updates to region/split structure.</text>
+
+  <rect x="658" y="1048" width="494" height="60" rx="6" fill="#f5f3ff" stroke="#d6bbfb" stroke-dasharray="7 5"/>
+  <text class="note" x="678" y="1073">Training only: weighted label-free CE before/after projection</text>
+  <text class="note" x="678" y="1095">+ keep/no-op KL + margin, entropy, and ΔZ regularizers.</text>
+
+  <text class="section" x="658" y="1142">OUTPUTS</text>
+  <rect x="658" y="1156" width="494" height="95" rx="6" fill="#ecfdf3" stroke="#6ce9a6"/>
+  <text class="output" x="678" y="1186">Candidate bank {Pʳᵉᶠ(s) = softmax(Zˢ)}</text>
+  <text class="equation" x="678" y="1217">yʳᵉᶠ(s) = argmax Pʳᵉᶠ(s)</text>
+  <text class="note" x="678" y="1240">Fixed path uses one s; diagnostics sweep multiple s.</text>
+
+  <!-- Stage 3 -->
+  <rect x="1220" y="390" width="550" height="72" rx="8" fill="#f5f3ff"/>
+  <circle cx="1258" cy="426" r="22" fill="#7f56d9"/>
+  <text class="badge" x="1258" y="426">3</text>
+  <text class="stage-title" x="1292" y="434">Episodic Meta Adaptation</text>
+  <text class="section" x="1248" y="498">INPUTS</text>
+  <rect x="1248" y="512" width="494" height="88" rx="6" fill="#f5f3ff" stroke="#d6bbfb"/>
+  <text class="equation" x="1268" y="539">Pʳᵉᶠ, Pᵗ, yᵗ, cᵗ, vᵗ, yᴿ, yⁿᵒᵒᵖ, y₀, w₀</text>
+  <text class="note" x="1268" y="566">w₀ is shared across scenes; no ground-truth target.</text>
+  <text class="note" x="1268" y="588">Pʳᵉᶠ is the selected Refiner-scale candidate.</text>
+
+  <rect x="1248" y="625" width="494" height="145" rx="6" fill="#f5f3ff" stroke="#d6bbfb"/>
+  <text class="op-title" x="1268" y="655">3a. Construct label-free masks</text>
+  <text class="equation" x="1268" y="685">Mᶜᵒʳʳ = [vᵗ≥2] [cᵗ≥τ] [yᵗ≠yʳᵉᶠ]</text>
+  <text class="equation" x="1268" y="713">             ∧ [yᵗ=yᴿ or yᵗ=yⁿᵒᵒᵖ]</text>
+  <text class="body" x="1268" y="744">Mᵏᵉᵉᵖ: Refiner agrees with temporal/base/structure</text>
+
+  <path class="inner" d="M1495 770 V794"/>
+  <rect x="1248" y="794" width="494" height="180" rx="6" fill="#f5f3ff" stroke="#d6bbfb"/>
+  <text class="op-title" x="1268" y="824">3b. Support adaptation of PoE weight</text>
+  <text class="equation" x="1268" y="854">Pʷ ∝ (Pʳᵉᶠ)¹⁻ʷ (Pᵗ)ʷ</text>
+  <text class="body" x="1268" y="884">Split scene into support/query subsets.</text>
+  <text class="equation" x="1268" y="914">L = λc NLL(Pʷ,yᵗ;Mᶜᵒʳʳ) + λk KL(Pʷ,Pʳᵉᶠ;Mᵏᵉᵉᵖ)</text>
+  <text class="equation" x="1268" y="944">     + λe H(Pʷ),     w′ = w₀ − α∇wLsupport</text>
+
+  <path class="inner" d="M1495 974 V998"/>
+  <rect x="1248" y="998" width="494" height="110" rx="6" fill="#f5f3ff" stroke="#d6bbfb"/>
+  <text class="op-title" x="1268" y="1028">3c. Query rollback</text>
+  <text class="equation" x="1268" y="1058">use w* = w′ only if Lquery(w′) ≤ Lquery(w₀)</text>
+  <text class="body" x="1268" y="1086">otherwise retain the shared initialization w₀</text>
+
+  <text class="section" x="1248" y="1142">OUTPUTS</text>
+  <rect x="1248" y="1156" width="494" height="95" rx="6" fill="#ecfdf3" stroke="#6ce9a6"/>
+  <text class="output" x="1268" y="1186">Pᵐᵉᵗᵃ = Pʷ*,  yᵐᵉᵗᵃ = argmax Pᵐᵉᵗᵃ</text>
+  <text class="note" x="1268" y="1217">Also output selected weight, query gain, accept flag.</text>
+
+  <!-- Stage 4 -->
+  <rect x="1810" y="390" width="550" height="72" rx="8" fill="#fff1f3"/>
+  <circle cx="1848" cy="426" r="22" fill="#f04438"/>
+  <text class="badge" x="1848" y="426">4</text>
+  <text class="stage-title" x="1882" y="434">Error Verifier &amp; Update</text>
+  <text class="section" x="1838" y="498">INPUTS</text>
+  <rect x="1838" y="512" width="494" height="88" rx="6" fill="#fff1f3" stroke="#fda29b"/>
+  <text class="equation" x="1858" y="539">yᵐᵉᵗᵃ, Pᵐᵉᵗᵃ, yᵗ, cᵗ, vᵗ, y₀, yᴿ, yⁿᵒᵒᵖ, R</text>
+  <text class="note" x="1858" y="566">Temporal and structural sources verify proposed changes.</text>
+  <text class="note" x="1858" y="588">No source is derived from ground-truth labels.</text>
+
+  <rect x="1838" y="625" width="494" height="128" rx="6" fill="#fff1f3" stroke="#fda29b"/>
+  <text class="op-title" x="1858" y="655">4a. High-confidence point gate</text>
+  <text class="equation" x="1858" y="686">Mpoint = [vᵗ≥2] ∧ [cᵗ≥τ] ∧ [yᵗ≠y₀]</text>
+  <text class="body" x="1858" y="716">accepted temporal errors can override yᵐᵉᵗᵃ</text>
+  <text class="note" x="1858" y="741">This is the fixed Area-5 best path.</text>
+
+  <path class="inner" d="M2085 753 V777"/>
+  <rect x="1838" y="777" width="494" height="185" rx="6" fill="#fff1f3" stroke="#fda29b"/>
+  <text class="op-title" x="1858" y="807">4b. Optional region-risk gate</text>
+  <text class="equation" x="1858" y="838">ρᵢ = (temporal confidence + vote support</text>
+  <text class="equation" x="1858" y="866">       + structural agreement) / 3</text>
+  <text class="equation" x="1858" y="895">ρ(Rⱼ) = mean changed-point reliability in Rⱼ</text>
+  <text class="body" x="1858" y="925">rollback a whole region when ρ(Rⱼ) &lt; threshold</text>
+  <text class="note" x="1858" y="950">Best on Area 2; retained as an explored verifier.</text>
+
+  <path class="inner" d="M2085 962 V986"/>
+  <rect x="1838" y="986" width="494" height="122" rx="6" fill="#fff1f3" stroke="#fda29b"/>
+  <text class="op-title" x="1858" y="1016">4c. Route the update</text>
+  <text class="equation" x="1858" y="1047">accept → yᵗ;  keep → yᵐᵉᵗᵃ;  rollback → fallback</text>
+  <text class="body" x="1858" y="1077">fallback is Refiner or base prediction by strategy</text>
+
+  <text class="section" x="1838" y="1142">OUTPUTS</text>
+  <rect x="1838" y="1156" width="494" height="95" rx="6" fill="#ecfdf3" stroke="#6ce9a6"/>
+  <text class="output" x="1858" y="1186">Final label-free semantic prediction y*</text>
+  <text class="equation" x="1858" y="1217">y* = where(Maccept, target, safe fallback)</text>
+
+  <!-- Cross-stage flows -->
+  <path class="flow" d="M315 330 V390"/>
+  <path class="flow" d="M905 330 V390"/>
+  <path class="flow" d="M1495 330 V390"/>
+  <path class="flow" d="M2085 330 V390"/>
+  <path class="flow" d="M562 1185 H630"/>
+  <path class="flow" d="M1152 1185 H1220"/>
+  <path class="flow" d="M1742 1185 H1810"/>
+  <text class="note" x="575" y="1174">Q,Tˢ</text>
+  <text class="note" x="1162" y="1174">Pʳᵉᶠ</text>
+  <text class="note" x="1751" y="1174">yᵐᵉᵗᵃ</text>
+
+  <!-- Meta outer loop and evaluation-only branch -->
+  <g filter="url(#shadow)">
+    <rect x="930" y="1370" width="840" height="145" rx="8" fill="#f5f3ff" stroke="#7f56d9" stroke-width="2" stroke-dasharray="9 7"/>
+    <rect x="1810" y="1370" width="550" height="145" rx="8" fill="#fff5f4" stroke="#b42318" stroke-width="2" stroke-dasharray="9 7"/>
+  </g>
+  <text class="op-title" x="960" y="1405">Cross-scene meta outer loop — training only</text>
+  <text class="body" x="960" y="1436">Non-test scenes → prediction-only episodes → region-parity support/query</text>
+  <text class="equation" x="960" y="1467">first-order query gradient updates shared initialization w₀</text>
+  <text class="note" x="960" y="1495">Area-5 labels never participate in this loop.</text>
+  <path class="train" d="M1350 1370 V1328 H1495 V1290"/>
+
+  <text class="op-title" x="1840" y="1405" fill="#b42318">Ground truth and metrics</text>
+  <text class="body" x="1840" y="1436">y* + labels → mIoU / mAcc / oAcc</text>
+  <text class="body" x="1840" y="1467">labels + candidate bank → oracle diagnostics</text>
+  <text class="note" x="1840" y="1495">This branch never feeds back into correction.</text>
+  <path class="label-flow" d="M2085 1290 V1370"/>
+</svg>

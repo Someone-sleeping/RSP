@@ -13,6 +13,19 @@ The four modules are:
 
 ![Four-stage label-free error-guided correction data flow](assets/four_stage_dataflow.svg)
 
+The overview above summarizes the contribution-level flow. The detailed tensor-level figure below exposes every module's inputs, internal operators, decision masks, and outputs.
+
+![Detailed tensor-level four-stage data flow](assets/four_stage_dataflow_detailed.svg)
+
+| Stage | Inputs | Internal decision | Outputs consumed by the next stage |
+|---|---|---|---|
+| Error-guided split | `Z0`, `P0`, `F`, `XYZ`, `RGB`, regions `R` | region purity/entropy, two-means child separation, child semantic disagreement | query indices `Q`, split targets `T_split`, refine/keep masks, projected no-op prediction |
+| Error-query Refiner | `F`, `XYZ`, `Q`, `Z0`, `R`, `T_split`, scale `s` | point MLP plus bidirectional query/scene attention; add and structurally project residual logits | residual `delta_Z`, candidate probability `P_ref(s)`, candidate prediction `y_ref(s)` |
+| Episodic Meta | `P_ref`, temporal `P_t/y_t/c_t/v_t`, region/no-op/base predictions, initialization `w0` | label-free correction/keep masks, support adaptation, query-loss rollback | selected PoE weight `w*`, `P_meta`, `y_meta`, query gain and accept flag |
+| Error verifier | `y_meta`, temporal target/confidence/votes, structural predictions and `R` | high-confidence point gate; optional region reliability and rollback | final prediction `y*` and correction/rollback masks |
+
+The fixed Area 5 path is therefore `Z0,F,R -> Q,T_split -> P_ref -> P_meta -> y*`. Refiner training and the cross-scene meta outer loop are dashed because they are completed before held-out inference. Ground truth appears only in the separate metric/oracle branch.
+
 Area 5 scale sweeps are upper-bound diagnostics because the scale was inspected on the evaluation fold. The strongest unchanged Area 5 result remains the previously fixed `meta_adapt_override_t80` result, 45.8386 mIoU. The 45.8979 result should not be presented as an unbiased final score.
 
 ## Actual Results
