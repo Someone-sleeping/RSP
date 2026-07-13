@@ -11,6 +11,8 @@ The four modules are:
 3. local or region-level correction verification;
 4. cross-scene episodic meta-optimization.
 
+![Four-stage label-free error-guided correction data flow](assets/four_stage_dataflow.svg)
+
 Area 5 scale sweeps are upper-bound diagnostics because the scale was inspected on the evaluation fold. The strongest unchanged Area 5 result remains the previously fixed `meta_adapt_override_t80` result, 45.8386 mIoU. The 45.8979 result should not be presented as an unbiased final score.
 
 ## Actual Results

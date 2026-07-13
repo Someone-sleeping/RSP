@@ -1,0 +1,155 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1000" viewBox="0 0 1800 1000" role="img" aria-labelledby="title desc">
+  <title id="title">Four-stage label-free error-guided GrowSP correction data flow</title>
+  <desc id="desc">A frozen GrowSP model produces point features and predictions. Error diagnosis drives superpoint restructuring, a transformer refiner proposes residual candidates, and a meta-adaptive verifier accepts or rolls back updates. Ground truth is used only for evaluation and oracle diagnostics.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#344054"/>
+    </marker>
+    <marker id="arrow-red" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#b42318"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#101828" flood-opacity="0.10"/>
+    </filter>
+    <style>
+      text { font-family: "DejaVu Sans"; letter-spacing: 0; }
+      .title { font-size: 35px; font-weight: 700; fill: #101828; }
+      .subtitle { font-size: 20px; font-weight: 400; fill: #475467; }
+      .box-title { font-size: 22px; font-weight: 700; fill: #101828; }
+      .box-title-tight { font-size: 19px; font-weight: 700; fill: #101828; }
+      .box-title-compact { font-size: 17px; font-weight: 700; fill: #101828; }
+      .box-text { font-size: 17px; font-weight: 400; fill: #344054; }
+      .small { font-size: 15px; font-weight: 400; fill: #475467; }
+      .label { font-size: 15px; font-weight: 600; fill: #344054; }
+      .label-red { font-size: 15px; font-weight: 600; fill: #b42318; }
+      .badge { font-size: 17px; font-weight: 700; fill: #ffffff; text-anchor: middle; dominant-baseline: middle; }
+      .arrow { fill: none; stroke: #344054; stroke-width: 3; marker-end: url(#arrow); }
+      .aux-arrow { fill: none; stroke: #667085; stroke-width: 2.5; stroke-dasharray: 9 7; marker-end: url(#arrow); }
+      .label-arrow { fill: none; stroke: #b42318; stroke-width: 2.5; stroke-dasharray: 9 7; marker-end: url(#arrow-red); }
+    </style>
+  </defs>
+
+  <rect width="1800" height="1000" fill="#f8fafc"/>
+  <text class="title" x="60" y="58">Label-free Error-Guided Optimization for Frozen GrowSP</text>
+  <text class="subtitle" x="60" y="92">Locate semantic conflict → restructure regions → propose corrections → verify reliability → update conservatively</text>
+
+  <!-- Frozen backbone path -->
+  <g filter="url(#shadow)">
+    <rect x="55" y="145" width="225" height="115" rx="8" fill="#ffffff" stroke="#98a2b3" stroke-width="2"/>
+    <rect x="345" y="145" width="250" height="115" rx="8" fill="#eef4ff" stroke="#6172f3" stroke-width="2"/>
+    <rect x="660" y="145" width="285" height="115" rx="8" fill="#ffffff" stroke="#6172f3" stroke-width="2"/>
+  </g>
+  <text class="box-title" x="82" y="187">3D Point Cloud</text>
+  <text class="box-text" x="82" y="219">XYZ, RGB, superpoints</text>
+  <text class="box-title" x="380" y="187">Frozen GrowSP</text>
+  <text class="box-text" x="380" y="219">Backbone + semantic centers</text>
+  <text class="box-title" x="694" y="187">Frozen Representations</text>
+  <text class="box-text" x="694" y="219">Features F, scores P₀, regions R</text>
+  <path class="arrow" d="M280 202 H345"/>
+  <path class="arrow" d="M595 202 H660"/>
+
+  <!-- Historical references -->
+  <g filter="url(#shadow)">
+    <rect x="55" y="350" width="225" height="135" rx="8" fill="#f2f4f7" stroke="#667085" stroke-width="2"/>
+  </g>
+  <text class="box-title" x="82" y="390">Frozen History</text>
+  <text class="box-text" x="82" y="422">Aligned checkpoints</text>
+  <text class="small" x="82" y="450">Temporal probabilities</text>
+  <text class="small" x="82" y="473">and semantic votes</text>
+
+  <!-- Stage 1 -->
+  <g filter="url(#shadow)">
+    <rect x="345" y="330" width="280" height="175" rx="8" fill="#fff7ed" stroke="#f79009" stroke-width="2.5"/>
+    <circle cx="375" cy="358" r="18" fill="#f79009"/>
+  </g>
+  <text class="badge" x="375" y="358">1</text>
+  <text class="box-title" x="405" y="365">Error Diagnosis</text>
+  <text class="box-text" x="375" y="407">• low confidence / high entropy</text>
+  <text class="box-text" x="375" y="438">• temporal semantic conflict</text>
+  <text class="box-text" x="375" y="469">• region impurity / inconsistency</text>
+  <text class="small" x="375" y="493">Output: error queries</text>
+
+  <!-- Stage 2 -->
+  <g filter="url(#shadow)">
+    <rect x="685" y="330" width="280" height="175" rx="8" fill="#ecfdf3" stroke="#12b76a" stroke-width="2.5"/>
+    <circle cx="715" cy="358" r="18" fill="#12b76a"/>
+  </g>
+  <text class="badge" x="715" y="358">2</text>
+  <text class="box-title-compact" x="745" y="365">Superpoint Split/Merge</text>
+  <text class="box-text" x="715" y="407">• conservative local split</text>
+  <text class="box-text" x="715" y="438">• region projection</text>
+  <text class="box-text" x="715" y="469">• unsupported-child rollback</text>
+  <text class="small" x="715" y="493">Output: correction support</text>
+
+  <!-- Stage 3 -->
+  <g filter="url(#shadow)">
+    <rect x="1025" y="330" width="300" height="175" rx="8" fill="#eef4ff" stroke="#6172f3" stroke-width="2.5"/>
+    <circle cx="1055" cy="358" r="18" fill="#6172f3"/>
+  </g>
+  <text class="badge" x="1055" y="358">3</text>
+  <text class="box-title" x="1085" y="365">Error-Query Refiner</text>
+  <text class="box-text" x="1055" y="407">• Transformer query interaction</text>
+  <text class="box-text" x="1055" y="438">• semantic residual ΔP</text>
+  <text class="box-text" x="1055" y="469">• multi-scale candidate bank</text>
+  <text class="small" x="1055" y="493">Output: candidate hypotheses</text>
+
+  <!-- Stage 4 -->
+  <g filter="url(#shadow)">
+    <rect x="1385" y="305" width="355" height="225" rx="8" fill="#fff1f3" stroke="#f04438" stroke-width="2.5"/>
+    <circle cx="1415" cy="335" r="18" fill="#f04438"/>
+  </g>
+  <text class="badge" x="1415" y="335">4</text>
+  <text class="box-title" x="1445" y="342">Meta-Adaptive Verifier</text>
+  <text class="box-text" x="1415" y="384">• temporal agreement</text>
+  <text class="box-text" x="1415" y="415">• region / projection consistency</text>
+  <text class="box-text" x="1415" y="446">• confidence preservation</text>
+  <text class="box-text" x="1415" y="477">• episodic support/query adaptation</text>
+  <text class="small" x="1415" y="510">Decision: accept, rollback, residual scale</text>
+
+  <path class="arrow" d="M802 260 V292 H485 V330"/>
+  <path class="aux-arrow" d="M280 417 H345"/>
+  <path class="arrow" d="M625 417 H685"/>
+  <path class="arrow" d="M965 417 H1025"/>
+  <path class="arrow" d="M1325 417 H1385"/>
+
+  <!-- Label-free meta episodes -->
+  <g filter="url(#shadow)">
+    <rect x="1025" y="605" width="300" height="125" rx="8" fill="#f5f3ff" stroke="#7f56d9" stroke-width="2"/>
+  </g>
+  <text class="box-title-tight" x="1055" y="645">Non-test Scene Episodes</text>
+  <text class="box-text" x="1055" y="677">Prediction-only support/query</text>
+  <text class="small" x="1055" y="706">Cross-scene outer optimization</text>
+  <path class="aux-arrow" d="M1325 667 H1355 V500 H1385"/>
+
+  <!-- Output -->
+  <g filter="url(#shadow)">
+    <rect x="1385" y="605" width="355" height="125" rx="8" fill="#ffffff" stroke="#101828" stroke-width="2.5"/>
+  </g>
+  <text class="box-title-tight" x="1420" y="649">Conservative Update</text>
+  <text class="box-text" x="1420" y="681">P* = projection(P₀ + accepted ΔP)</text>
+  <text class="small" x="1420" y="709">Final refined semantic prediction</text>
+  <path class="arrow" d="M1562 530 V605"/>
+
+  <!-- Method boundary -->
+  <rect x="25" y="115" width="1750" height="650" rx="14" fill="none" stroke="#98a2b3" stroke-width="2" stroke-dasharray="12 8"/>
+  <rect x="55" y="745" width="205" height="34" rx="6" fill="#f8fafc"/>
+  <text class="label" x="68" y="768">LABEL-FREE METHOD PATH</text>
+
+  <!-- Evaluation-only branch -->
+  <g filter="url(#shadow)">
+    <rect x="55" y="835" width="225" height="100" rx="8" fill="#fff5f4" stroke="#b42318" stroke-width="2"/>
+    <rect x="345" y="835" width="280" height="100" rx="8" fill="#ffffff" stroke="#98a2b3" stroke-width="2"/>
+    <rect x="690" y="835" width="325" height="100" rx="8" fill="#ffffff" stroke="#98a2b3" stroke-width="2"/>
+  </g>
+  <text class="box-title" x="86" y="875" fill="#b42318">Ground Truth</text>
+  <text class="small" x="86" y="906">Metrics and oracle only</text>
+  <text class="box-title" x="378" y="875">Final Metrics</text>
+  <text class="box-text" x="378" y="906">mIoU / mAcc / oAcc</text>
+  <text class="box-title" x="725" y="875">Oracle Diagnostics</text>
+  <text class="box-text" x="725" y="906">Candidate potential, not a method result</text>
+  <path class="label-arrow" d="M280 870 H345"/>
+  <path class="label-arrow" d="M280 906 V965 H852 V935"/>
+  <path class="aux-arrow" d="M1562 730 V795 H485 V835"/>
+  <path class="aux-arrow" d="M1175 505 V800 H852 V835"/>
+  <text class="label-red" x="335" y="988">Ground truth is restricted to evaluation and oracle analysis.</text>
+</svg>
