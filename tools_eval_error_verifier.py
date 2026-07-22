@@ -20,6 +20,7 @@ from lib.correction_strategies import (
     regionwise_refiner_scale_selection,
 )
 from lib.meta_optimizer import meta_optimize_poe_weight
+from lib.meta_refiner import meta_adapt_refiner_gates
 from lib.split_regions import build_region_consistency_queries, build_split_region_queries
 from models.fpn import Res16FPN18
 from models.query_refiner import ErrorQueryRefiner
@@ -63,6 +64,21 @@ def parse_args():
     parser.add_argument("--meta_entropy_weight", type=float, default=0.01)
     parser.add_argument("--meta_query_tolerance", type=float, default=0.0)
     parser.add_argument("--meta_classwise", action="store_true", default=False)
+    parser.add_argument("--meta_refiner", action="store_true", default=False)
+    parser.add_argument("--meta_refiner_classwise", action="store_true", default=False)
+    parser.add_argument("--meta_refiner_initial_scale", type=float, default=1.0)
+    parser.add_argument("--meta_refiner_min_scale", type=float, default=0.25)
+    parser.add_argument("--meta_refiner_max_scale", type=float, default=1.75)
+    parser.add_argument("--meta_refiner_inner_steps", type=int, default=5)
+    parser.add_argument("--meta_refiner_inner_lr", type=float, default=0.1)
+    parser.add_argument("--meta_refiner_correction_weight", type=float, default=1.0)
+    parser.add_argument("--meta_refiner_keep_weight", type=float, default=5.0)
+    parser.add_argument("--meta_refiner_entropy_weight", type=float, default=0.01)
+    parser.add_argument("--meta_refiner_scale_reg", type=float, default=0.1)
+    parser.add_argument("--meta_refiner_query_tolerance", type=float, default=0.0)
+    parser.add_argument("--meta_refiner_adapt_bias", action="store_true", default=False)
+    parser.add_argument("--meta_refiner_bias_reg", type=float, default=0.1)
+    parser.add_argument("--meta_refiner_verify_threshold", type=float, default=0.64)
     parser.add_argument("--four_stage_diagnostic", action="store_true", default=False)
     parser.add_argument("--diagnostic_multi_proposal", action="store_true", default=False)
     parser.add_argument("--skip_region_oracle", action="store_true", default=False)
@@ -199,6 +215,7 @@ def run_split_refiner(
     regions,
     multi_proposal=False,
     delta_override=None,
+    return_components=False,
 ):
     batch_ids = coords[:, 0].long().cuda()
     point_coords = coords[:, 1:].float().cuda()
@@ -251,19 +268,25 @@ def run_split_refiner(
         query_indices = torch.unique(torch.cat([query_indices, consistency_queries], dim=0))
     refine_mask = refine_mask | consistency_mask
     keep_mask = keep_mask | consistency_keep
-    del refine_mask, keep_mask
-
     if delta_override is None:
         with torch.no_grad():
-            delta_scores = refiner(
+            refiner_output = refiner(
                 base_feats,
                 point_coords,
                 batch_ids,
                 query_indices,
                 regions,
                 use_region_branch=False,
+                return_components=return_components,
             )
+            if return_components:
+                delta_components = refiner_output
+                delta_scores = refiner_output["total"]
+            else:
+                delta_components = None
+                delta_scores = refiner_output
     else:
+        delta_components = None
         delta_scores = delta_override
     no_op_scores = project_region_and_split(base_scores, regions, split_targets)
     refined_scores = project_region_and_split(
@@ -271,7 +294,10 @@ def run_split_refiner(
         regions,
         split_targets,
     )
-    return no_op_scores, refined_scores, delta_scores, split_targets
+    outputs = (no_op_scores, refined_scores, delta_scores, split_targets)
+    if return_components:
+        return outputs + (delta_components, refine_mask, keep_mask)
+    return outputs
 
 
 def prediction_mapping(predictions, labels, num_classes):
@@ -353,6 +379,8 @@ def main():
     names.extend([f"epoch_{epoch}" for epoch in reference_epochs])
     if refiner is not None:
         names.extend(["split_noop", "split_refiner", "refiner_candidate_vote"])
+        if args.meta_refiner:
+            names.append("meta_refiner")
         if args.meta_optimize:
             names.append("meta_scene_poe")
         for blend_weight in blend_weights:
@@ -389,6 +417,20 @@ def main():
             )
             if args.meta_optimize:
                 names.append(f"meta_adapt_override_t{suffix}")
+            if args.meta_refiner:
+                names.extend(
+                    [
+                        f"meta_refiner_override_t{suffix}",
+                        f"meta_refiner_residual_verified_t{suffix}",
+                        f"meta_refiner_verified_union_t{suffix}",
+                        f"meta_refiner_poe_override_t{suffix}",
+                        f"meta_refiner_candidate_gate_t{suffix}",
+                        f"meta_refiner_verified_override_t{suffix}",
+                        f"meta_refiner_verified_poe_override_t{suffix}",
+                        f"meta_refiner_joint_structural_t{suffix}",
+                        f"meta_refiner_joint_temporal_t{suffix}",
+                    ]
+                )
     diagnostic_names = []
     if args.four_stage_diagnostic and refiner is not None:
         if args.diagnostic_multi_proposal:
@@ -424,6 +466,16 @@ def main():
         "adapted_weight_sum": 0.0,
         "query_gain_sum": 0.0,
         "correction_ratio_sum": 0.0,
+    }
+    meta_refiner_stats = {
+        "scenes": 0,
+        "accepted_scenes": 0,
+        "query_gain_sum": 0.0,
+        "correction_ratio_sum": 0.0,
+        "support_corrections": 0,
+        "query_corrections": 0,
+        "scale_sums": None,
+        "bias_norm_sum": 0.0,
     }
 
     def add_proxy(name, value, weight):
@@ -522,9 +574,11 @@ def main():
         no_op_pred = None
         refined_pred = None
         meta_adapted_pred = None
+        meta_refiner_pred = None
+        meta_refiner_probability = None
         diagnostic_scale_probabilities = []
         if refiner is not None:
-            no_op_scores, refined_scores, delta_scores, split_targets = run_split_refiner(
+            split_refiner_outputs = run_split_refiner(
                 args,
                 refiner,
                 base_scores,
@@ -532,7 +586,21 @@ def main():
                 coords,
                 features,
                 regions,
+                return_components=args.meta_refiner,
             )
+            if args.meta_refiner:
+                (
+                    no_op_scores,
+                    refined_scores,
+                    delta_scores,
+                    split_targets,
+                    delta_components,
+                    meta_refine_mask,
+                    _meta_keep_mask,
+                ) = split_refiner_outputs
+            else:
+                no_op_scores, refined_scores, delta_scores, split_targets = split_refiner_outputs
+                delta_components = None
             no_op_pred = no_op_scores.argmax(dim=1)
             refined_pred = refined_scores.argmax(dim=1)
             candidate_votes = F.one_hot(
@@ -559,6 +627,64 @@ def main():
             scene_predictions["split_refiner"] = refined_pred
             scene_predictions["refiner_candidate_vote"] = candidate_vote_pred
             refined_probability = F.softmax(refined_scores, dim=1)
+            if args.meta_refiner:
+                (
+                    meta_refiner_probability,
+                    meta_refiner_accepted,
+                    scene_meta_refiner_stats,
+                ) = meta_adapt_refiner_gates(
+                    base_scores.detach(),
+                    {name: value.detach() for name, value in delta_components.items()},
+                    refined_scores.detach(),
+                    temporal_mean_prob.detach(),
+                    temporal_vote_count.detach(),
+                    region_pred.detach(),
+                    no_op_pred.detach(),
+                    base_pred.detach(),
+                    regions.detach(),
+                    split_targets.detach(),
+                    residual_scale=args.refiner_scale,
+                    initial_scale=args.meta_refiner_initial_scale,
+                    min_scale=args.meta_refiner_min_scale,
+                    max_scale=args.meta_refiner_max_scale,
+                    confidence_threshold=args.selection_threshold,
+                    min_votes=args.min_temporal_votes,
+                    inner_steps=args.meta_refiner_inner_steps,
+                    inner_lr=args.meta_refiner_inner_lr,
+                    correction_weight=args.meta_refiner_correction_weight,
+                    keep_weight=args.meta_refiner_keep_weight,
+                    entropy_weight=args.meta_refiner_entropy_weight,
+                    scale_regularization=args.meta_refiner_scale_reg,
+                    query_tolerance=args.meta_refiner_query_tolerance,
+                    classwise=args.meta_refiner_classwise,
+                    refine_mask=meta_refine_mask.detach(),
+                    adapt_bias=args.meta_refiner_adapt_bias,
+                    bias_regularization=args.meta_refiner_bias_reg,
+                )
+                meta_refiner_pred = meta_refiner_probability.argmax(dim=1)
+                scene_predictions["meta_refiner"] = meta_refiner_pred
+                meta_refiner_stats["scenes"] += 1
+                meta_refiner_stats["accepted_scenes"] += int(meta_refiner_accepted)
+                meta_refiner_stats["query_gain_sum"] += float(
+                    scene_meta_refiner_stats["query_gain"]
+                )
+                meta_refiner_stats["correction_ratio_sum"] += float(
+                    scene_meta_refiner_stats["correction_ratio"]
+                )
+                meta_refiner_stats["support_corrections"] += int(
+                    scene_meta_refiner_stats["support_corrections"]
+                )
+                meta_refiner_stats["query_corrections"] += int(
+                    scene_meta_refiner_stats["query_corrections"]
+                )
+                scene_scales = scene_meta_refiner_stats["scales"]
+                if meta_refiner_stats["scale_sums"] is None:
+                    meta_refiner_stats["scale_sums"] = [0.0] * len(scene_scales)
+                for scale_id, scale in enumerate(scene_scales):
+                    meta_refiner_stats["scale_sums"][scale_id] += float(scale)
+                meta_refiner_stats["bias_norm_sum"] += float(
+                    scene_meta_refiner_stats["bias_norm"]
+                )
             if args.four_stage_diagnostic:
                 if args.diagnostic_multi_proposal:
                     multi_no_op_scores, multi_refined_scores, _multi_delta, _multi_split = run_split_refiner(
@@ -849,6 +975,117 @@ def main():
                     meta_adapt_override = meta_adapted_pred.clone()
                     meta_adapt_override[point_accept] = temporal_mean_pred[point_accept]
                     scene_predictions[f"meta_adapt_override_t{suffix}"] = meta_adapt_override
+                if meta_refiner_pred is not None:
+                    meta_refiner_override = meta_refiner_pred.clone()
+                    meta_refiner_override[point_accept] = temporal_mean_pred[point_accept]
+
+                    meta_refiner_changed = meta_refiner_pred != no_op_pred
+                    meta_refiner_residual_verified = meta_refiner_pred.clone()
+                    meta_refiner_residual_verified[
+                        meta_refiner_changed & ~residual_accept
+                    ] = no_op_pred[meta_refiner_changed & ~residual_accept]
+
+                    meta_refiner_verified_union = meta_refiner_residual_verified.clone()
+                    meta_refiner_union_compatible = verifier_changed & (
+                        (meta_refiner_verified_union == base_pred)
+                        | (meta_refiner_verified_union == point_region_union)
+                        | (no_op_pred == point_region_union)
+                    )
+                    meta_refiner_verified_union[meta_refiner_union_compatible] = (
+                        point_region_union[meta_refiner_union_compatible]
+                    )
+
+                    meta_refiner_poe_score = (
+                        (1.0 - args.meta_initial_weight)
+                        * torch.log(meta_refiner_probability.clamp_min(1e-6))
+                        + args.meta_initial_weight
+                        * torch.log(temporal_mean_prob.clamp_min(1e-6))
+                    )
+                    meta_refiner_poe_override = meta_refiner_poe_score.argmax(dim=1)
+                    meta_refiner_poe_override[point_accept] = temporal_mean_pred[point_accept]
+
+                    meta_candidate_support = temporal_vote_count.gather(
+                        1, meta_refiner_pred.unsqueeze(1)
+                    ).squeeze(1)
+                    meta_candidate_confidence = temporal_mean_prob.gather(
+                        1, meta_refiner_pred.unsqueeze(1)
+                    ).squeeze(1)
+                    meta_candidate_changed = meta_refiner_pred != refined_pred
+                    meta_candidate_accept = (
+                        (meta_candidate_support >= args.min_temporal_votes)
+                        & (
+                            meta_candidate_confidence
+                            >= args.meta_refiner_verify_threshold
+                        )
+                        & (
+                            (meta_refiner_pred == temporal_mean_pred)
+                            | (meta_refiner_pred == region_pred)
+                            | (meta_refiner_pred == no_op_pred)
+                        )
+                    )
+                    meta_candidate_gate = meta_refiner_pred.clone()
+                    meta_candidate_gate[
+                        meta_candidate_changed & ~meta_candidate_accept
+                    ] = refined_pred[meta_candidate_changed & ~meta_candidate_accept]
+                    meta_refiner_verified_override = meta_candidate_gate.clone()
+                    meta_refiner_verified_override[point_accept] = temporal_mean_pred[point_accept]
+
+                    verified_meta_probability = torch.where(
+                        (meta_candidate_changed & meta_candidate_accept)[:, None],
+                        meta_refiner_probability,
+                        refined_probability,
+                    )
+                    verified_meta_poe_score = (
+                        (1.0 - args.meta_initial_weight)
+                        * torch.log(verified_meta_probability.clamp_min(1e-6))
+                        + args.meta_initial_weight
+                        * torch.log(temporal_mean_prob.clamp_min(1e-6))
+                    )
+                    meta_refiner_verified_poe_override = verified_meta_poe_score.argmax(dim=1)
+                    meta_refiner_verified_poe_override[point_accept] = temporal_mean_pred[point_accept]
+
+                    meta_refiner_joint_structural = meta_init_override.clone()
+                    meta_joint_available = (
+                        meta_candidate_changed
+                        & meta_candidate_accept
+                        & (meta_init_override == refined_pred)
+                    )
+                    meta_refiner_joint_structural[meta_joint_available] = meta_refiner_pred[
+                        meta_joint_available
+                    ]
+                    meta_refiner_joint_temporal = meta_init_override.clone()
+                    meta_temporal_available = meta_joint_available & (
+                        meta_refiner_pred == temporal_mean_pred
+                    )
+                    meta_refiner_joint_temporal[meta_temporal_available] = meta_refiner_pred[
+                        meta_temporal_available
+                    ]
+
+                    scene_predictions[f"meta_refiner_override_t{suffix}"] = meta_refiner_override
+                    scene_predictions[
+                        f"meta_refiner_residual_verified_t{suffix}"
+                    ] = meta_refiner_residual_verified
+                    scene_predictions[
+                        f"meta_refiner_verified_union_t{suffix}"
+                    ] = meta_refiner_verified_union
+                    scene_predictions[
+                        f"meta_refiner_poe_override_t{suffix}"
+                    ] = meta_refiner_poe_override
+                    scene_predictions[
+                        f"meta_refiner_candidate_gate_t{suffix}"
+                    ] = meta_candidate_gate
+                    scene_predictions[
+                        f"meta_refiner_verified_override_t{suffix}"
+                    ] = meta_refiner_verified_override
+                    scene_predictions[
+                        f"meta_refiner_verified_poe_override_t{suffix}"
+                    ] = meta_refiner_verified_poe_override
+                    scene_predictions[
+                        f"meta_refiner_joint_structural_t{suffix}"
+                    ] = meta_refiner_joint_structural
+                    scene_predictions[
+                        f"meta_refiner_joint_temporal_t{suffix}"
+                    ] = meta_refiner_joint_temporal
 
         valid = labels != args.ignore_label
         inverse = inverse_map.long().cuda()
@@ -1012,6 +1249,23 @@ def main():
         }
     else:
         meta_summary = {}
+    if args.meta_refiner and meta_refiner_stats["scenes"] > 0:
+        scene_count = float(meta_refiner_stats["scenes"])
+        meta_refiner_summary = {
+            "scenes": int(meta_refiner_stats["scenes"]),
+            "accepted_scenes": int(meta_refiner_stats["accepted_scenes"]),
+            "accept_ratio": meta_refiner_stats["accepted_scenes"] / scene_count,
+            "mean_query_gain": meta_refiner_stats["query_gain_sum"] / scene_count,
+            "mean_correction_ratio": meta_refiner_stats["correction_ratio_sum"] / scene_count,
+            "support_corrections": int(meta_refiner_stats["support_corrections"]),
+            "query_corrections": int(meta_refiner_stats["query_corrections"]),
+            "mean_scales": [
+                value / scene_count for value in (meta_refiner_stats["scale_sums"] or [])
+            ],
+            "mean_bias_norm": meta_refiner_stats["bias_norm_sum"] / scene_count,
+        }
+    else:
+        meta_refiner_summary = {}
 
     for name, result in sorted(results.items(), key=lambda item: item[1]["mIoU"], reverse=True):
         print(
@@ -1022,6 +1276,8 @@ def main():
     print("label_free_selection", json.dumps(selection, sort_keys=True))
     if meta_summary:
         print("meta_optimizer", json.dumps(meta_summary, sort_keys=True))
+    if meta_refiner_summary:
+        print("meta_refiner", json.dumps(meta_refiner_summary, sort_keys=True))
     if args.output_json:
         output_dir = os.path.dirname(args.output_json)
         if output_dir:
@@ -1037,6 +1293,7 @@ def main():
                     "label_free_proxies": proxies,
                     "label_free_selection": selection,
                     "meta_optimizer": meta_summary,
+                    "meta_refiner": meta_refiner_summary,
                 },
                 output_file,
                 indent=2,

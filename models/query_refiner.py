@@ -58,16 +58,25 @@ class ErrorQueryRefiner(nn.Module):
         nn.init.zeros_(self.region_mlp[-1].weight)
         nn.init.zeros_(self.region_mlp[-1].bias)
 
-    def forward(self, point_feats, point_coords, batch_ids, query_indices, regions=None, use_region_branch=False):
+    def forward(
+        self,
+        point_feats,
+        point_coords,
+        batch_ids,
+        query_indices,
+        regions=None,
+        use_region_branch=False,
+        return_components=False,
+    ):
         point_coords = point_coords.float()
         if point_coords.size(1) > 3:
             point_coords = point_coords[:, :3]
 
-        delta_logits = self.point_mlp(point_feats)
+        point_delta = self.point_mlp(point_feats)
+        region_delta = point_delta.new_zeros(point_delta.shape)
         if use_region_branch and regions is not None:
             batch_ids = batch_ids.long().to(point_feats.device)
             regions = regions.long().to(point_feats.device).view(-1)
-            region_delta = delta_logits.new_zeros(delta_logits.shape)
             for batch_id in torch.unique(batch_ids):
                 scene_mask = batch_ids == batch_id
                 for region_id in torch.unique(regions[scene_mask]):
@@ -77,9 +86,16 @@ class ErrorQueryRefiner(nn.Module):
                     if mask.any():
                         region_feat = point_feats[mask].mean(dim=0, keepdim=True)
                         region_delta[mask] = self.region_mlp(region_feat)
-            delta_logits = delta_logits + region_delta
+        context_delta = point_delta.new_zeros(point_delta.shape)
         if query_indices.numel() == 0:
-            return delta_logits
+            if return_components:
+                return {
+                    "point": point_delta,
+                    "context": context_delta,
+                    "region": region_delta,
+                    "total": point_delta + region_delta,
+                }
+            return point_delta + region_delta
 
         batch_ids = batch_ids.long()
 
@@ -121,9 +137,17 @@ class ErrorQueryRefiner(nn.Module):
             scene_tokens = scene_tokens + scene_ctx.squeeze(0)
             scene_tokens = scene_tokens + self.ffn(scene_tokens)
 
-            delta_logits[scene_indices] = delta_logits[scene_indices] + self.out_proj(self.out_norm(scene_tokens))
+            context_delta[scene_indices] = self.out_proj(self.out_norm(scene_tokens))
 
-        return delta_logits
+        total_delta = point_delta + context_delta + region_delta
+        if return_components:
+            return {
+                "point": point_delta,
+                "context": context_delta,
+                "region": region_delta,
+                "total": total_delta,
+            }
+        return total_delta
 
 
 def refined_cross_entropy(refined_logits, pseudo_labels, trusted_mask, ignore_index=-1):
