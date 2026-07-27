@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 
 import matplotlib
 
@@ -14,7 +15,7 @@ from sklearn.utils.linear_assignment_ import linear_assignment
 from torch.utils.data import DataLoader
 
 from datasets.S3DIS import S3DIStest, cfl_collate_fn_test
-from lib.helper_ply import write_ply
+from lib.helper_ply import read_ply, write_ply
 from lib.meta_refiner import meta_adapt_refiner_gates
 from models.query_refiner import ErrorQueryRefiner
 from tools_eval_error_verifier import (
@@ -44,6 +45,15 @@ CLASS_COLORS = np.asarray(
     dtype=np.uint8,
 )
 
+MASK_BACKGROUND = np.asarray([205, 205, 205], dtype=np.uint8)
+MASK_COLORS = {
+    "semantic_difference": np.asarray([231, 111, 45], dtype=np.uint8),
+    "error": np.asarray([214, 48, 49], dtype=np.uint8),
+    "refiner_change": np.asarray([49, 116, 191], dtype=np.uint8),
+    "meta_change": np.asarray([139, 73, 178], dtype=np.uint8),
+    "split": np.asarray([29, 158, 117], dtype=np.uint8),
+}
+
 
 def parse_args():
     parser = argparse.ArgumentParser("Visualize Meta-Refiner qualitative results")
@@ -66,6 +76,11 @@ def parse_args():
     )
     parser.add_argument("--selection", choices=["success", "mixed", "failure"], default="mixed")
     parser.add_argument("--num_scenes", type=int, default=3)
+    parser.add_argument(
+        "--allow_repeated_room_types",
+        action="store_true",
+        help="Disable the default room-type-diverse qualitative selection.",
+    )
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--voxel_size", type=float, default=0.05)
     parser.add_argument("--input_dim", type=int, default=6)
@@ -113,11 +128,25 @@ def mapped_prediction(prediction, mapping):
 
 
 def point_accuracy(prediction, label):
-    valid = (label >= 0) & (label < len(CLASS_COLORS))
+    valid = evaluation_mask(label)
     return float((prediction[valid] == label[valid]).mean())
 
 
-def infer_scene(args, models, refiner, batch, scene_name):
+def evaluation_mask(label):
+    return (label >= 0) & (label < len(CLASS_COLORS))
+
+
+def evaluation_error_mask(prediction, label):
+    valid = evaluation_mask(label)
+    return valid & (prediction != label)
+
+
+def evaluation_error_ratio(prediction, label):
+    valid = evaluation_mask(label)
+    return float(evaluation_error_mask(prediction, label).sum() / valid.sum())
+
+
+def infer_scene(args, models, refiner, batch, scene_name, scene_file):
     base_model, base_centers, temporal_references = models
     coords, features, inverse_map, labels, _index, region = batch
     in_field = ME.TensorField(features, coords, device=0)
@@ -193,25 +222,29 @@ def infer_scene(args, models, refiner, batch, scene_name):
     )
 
     inverse = inverse_map.long().cuda()
-    valid = (labels >= 0) & (labels < args.semantic_class)
-    full_xyz = coords[:, 1:].cpu().numpy()[inverse_map.long().numpy()]
-    full_rgb = np.clip(
-        (features[:, :3].cpu().numpy()[inverse_map.long().numpy()] + 0.5)
-        * 255.0,
-        0,
-        255,
-    ).astype(np.uint8)
+    raw_data = read_ply(scene_file)
+    full_xyz = np.vstack(
+        (raw_data["x"], raw_data["y"], raw_data["z"])
+    ).T.astype(np.float32)
+    full_rgb = np.vstack(
+        (raw_data["red"], raw_data["green"], raw_data["blue"])
+    ).T.astype(np.uint8)
+    if len(full_xyz) != len(inverse_map) or len(full_xyz) != len(labels):
+        raise ValueError(
+            f"Raw/inverse-map size mismatch for {scene_name}: raw={len(full_xyz)}, "
+            f"inverse={len(inverse_map)}, labels={len(labels)}"
+        )
     return {
         "name": scene_name,
-        "xyz": full_xyz[valid.numpy()],
-        "rgb": full_rgb[valid.numpy()],
-        "label": labels[valid].numpy(),
-        "base": base_prediction[inverse][valid.cuda()].cpu().numpy(),
-        "split_refiner": refined_scores.argmax(dim=1)[inverse][valid.cuda()].cpu().numpy(),
-        "meta": meta_probability.argmax(dim=1)[inverse][valid.cuda()].cpu().numpy(),
-        "refine_mask": refine_mask[inverse][valid.cuda()].cpu().numpy().astype(bool),
-        "split_mask": (split_targets >= 0)[inverse][valid.cuda()].cpu().numpy().astype(bool),
-        "split_targets": split_targets[inverse][valid.cuda()].cpu().numpy(),
+        "xyz": full_xyz,
+        "rgb": full_rgb,
+        "label": labels.numpy(),
+        "base": base_prediction[inverse].cpu().numpy(),
+        "split_refiner": refined_scores.argmax(dim=1)[inverse].cpu().numpy(),
+        "meta": meta_probability.argmax(dim=1)[inverse].cpu().numpy(),
+        "refine_mask": refine_mask[inverse].cpu().numpy().astype(bool),
+        "split_mask": (split_targets >= 0)[inverse].cpu().numpy().astype(bool),
+        "split_targets": split_targets[inverse].cpu().numpy(),
         "meta_accepted": bool(meta_accepted),
         "meta_stats": meta_stats,
     }
@@ -228,7 +261,34 @@ def scene_score(scene, selection):
     return 100.0 * scene["meta_gain"] + 0.2 * structure + meta_change - visual_penalty
 
 
-def select_scenes(scenes, selection, count):
+def room_type(scene_name):
+    match = re.match(r"^Area_\d+_(.+)_\d+$", scene_name.lstrip("/"))
+    return match.group(1) if match else scene_name.lstrip("/")
+
+
+def diversify_room_types(ranked_scenes, count):
+    selected = []
+    selected_ids = set()
+    used_room_types = set()
+    for scene in ranked_scenes:
+        current_type = room_type(scene["name"])
+        if current_type in used_room_types:
+            continue
+        selected.append(scene)
+        selected_ids.add(id(scene))
+        used_room_types.add(current_type)
+        if len(selected) >= count:
+            return selected
+    for scene in ranked_scenes:
+        if id(scene) in selected_ids:
+            continue
+        selected.append(scene)
+        if len(selected) >= count:
+            break
+    return selected
+
+
+def select_scenes(scenes, selection, count, enforce_diversity=True):
     count = max(int(count), 1)
     candidates = [
         scene
@@ -242,11 +302,14 @@ def select_scenes(scenes, selection, count):
     if not candidates:
         candidates = scenes
     if selection != "mixed":
-        return sorted(
+        ranked = sorted(
             candidates,
             key=lambda scene: scene_score(scene, selection),
             reverse=True,
-        )[:count]
+        )
+        if enforce_diversity:
+            return diversify_room_types(ranked, count)
+        return ranked[:count]
 
     positive_count = (count + 1) // 2
     negative_count = count - positive_count
@@ -272,6 +335,13 @@ def select_scenes(scenes, selection, count):
             added += 1
             if added >= target:
                 break
+    if enforce_diversity:
+        ranked = selected + [
+            scene
+            for scene in positive + negative
+            if id(scene) not in selected_ids
+        ]
+        return diversify_room_types(ranked, count)
     return selected[:count]
 
 
@@ -311,6 +381,15 @@ def draw_points(axis, xyz, colors, title, overlay=None):
     axis.axis("off")
 
 
+def binary_colors(mask, positive_color):
+    colors = np.broadcast_to(
+        MASK_BACKGROUND,
+        (len(mask), 3),
+    ).copy()
+    colors[np.asarray(mask, dtype=bool)] = positive_color
+    return colors
+
+
 def difference_colors(scene, mapping):
     colors = np.full((len(scene["xyz"]), 3), 205, dtype=np.uint8)
     suspicious = scene["refine_mask"]
@@ -321,6 +400,32 @@ def difference_colors(scene, mapping):
         mapped_targets = mapping[split_targets]
         colors[split] = CLASS_COLORS[mapped_targets]
     return colors
+
+
+def export_binary_mask(scene_dir, scene, name, mask, positive_color):
+    mask = np.asarray(mask, dtype=bool)
+    colors = binary_colors(mask, positive_color)
+    write_ply(
+        os.path.join(scene_dir, f"{name}_01.ply"),
+        [
+            scene["xyz"].astype(np.float32),
+            colors,
+            scene["rgb"].astype(np.uint8),
+            mask.astype(np.int32),
+        ],
+        [
+            "x",
+            "y",
+            "z",
+            "red",
+            "green",
+            "blue",
+            "original_red",
+            "original_green",
+            "original_blue",
+            "value_01",
+        ],
+    )
 
 
 def export_scene(output_dir, scene, mapping):
@@ -358,6 +463,38 @@ def export_scene(output_dir, scene, mapping):
             "split",
         ],
     )
+    mapped_base = variants["frozen_prediction"]
+    mapped_refiner = variants["split_refiner"]
+    mapped_meta = variants["meta_adaptation"]
+    binary_masks = {
+        "semantic_difference": (
+            scene["refine_mask"],
+            MASK_COLORS["semantic_difference"],
+        ),
+        "split_target": (scene["split_mask"], MASK_COLORS["split"]),
+        "frozen_error": (
+            evaluation_error_mask(mapped_base, scene["label"]),
+            MASK_COLORS["error"],
+        ),
+        "refiner_change": (
+            scene["split_refiner"] != scene["base"],
+            MASK_COLORS["refiner_change"],
+        ),
+        "refiner_error": (
+            evaluation_error_mask(mapped_refiner, scene["label"]),
+            MASK_COLORS["error"],
+        ),
+        "meta_change": (
+            scene["meta"] != scene["split_refiner"],
+            MASK_COLORS["meta_change"],
+        ),
+        "meta_error": (
+            evaluation_error_mask(mapped_meta, scene["label"]),
+            MASK_COLORS["error"],
+        ),
+    }
+    for name, (mask, positive_color) in binary_masks.items():
+        export_binary_mask(scene_dir, scene, name, mask, positive_color)
 
 
 def main():
@@ -396,7 +533,14 @@ def main():
     for batch in loader:
         scene_index = int(batch[4][0])
         scenes.append(
-            infer_scene(args, models, refiner, batch, dataset.name[scene_index])
+            infer_scene(
+                args,
+                models,
+                refiner,
+                batch,
+                dataset.name[scene_index],
+                dataset.file[scene_index],
+            )
         )
 
     all_labels = np.concatenate([scene["label"] for scene in scenes])
@@ -411,11 +555,19 @@ def main():
         scene["meta_acc"] = point_accuracy(mapped_meta, scene["label"])
         scene["refiner_gain"] = scene["refiner_acc"] - scene["base_acc"]
         scene["meta_gain"] = scene["meta_acc"] - scene["refiner_acc"]
+        scene["refiner_changed_ratio"] = float(
+            (scene["split_refiner"] != scene["base"]).mean()
+        )
         scene["meta_changed_ratio"] = float(
             (scene["meta"] != scene["split_refiner"]).mean()
         )
 
-    selected = select_scenes(scenes, args.selection, args.num_scenes)
+    selected = select_scenes(
+        scenes,
+        args.selection,
+        args.num_scenes,
+        enforce_diversity=not args.allow_repeated_room_types,
+    )
     rows = len(selected)
     figure, axes = plt.subplots(
         rows,
@@ -484,11 +636,108 @@ def main():
     figure.savefig(figure_path, bbox_inches="tight", facecolor="white")
     plt.close(figure)
 
+    diagnostic_figure, diagnostic_axes = plt.subplots(
+        rows,
+        7,
+        figsize=(20.5, 2.45 * rows),
+        dpi=240,
+    )
+    if rows == 1:
+        diagnostic_axes = np.expand_dims(diagnostic_axes, axis=0)
+    for row, scene in enumerate(selected):
+        mapped_base = mapped_prediction(scene["base"], mapping)
+        mapped_refiner = mapped_prediction(scene["split_refiner"], mapping)
+        mapped_meta = mapped_prediction(scene["meta"], mapping)
+        diagnostic_panels = (
+            (scene["rgb"], "Original RGB"),
+            (
+                binary_colors(
+                    scene["refine_mask"],
+                    MASK_COLORS["semantic_difference"],
+                ),
+                f"Semantic difference 0/1\n1: {100.0 * scene['refine_mask'].mean():.2f}%",
+            ),
+            (
+                binary_colors(
+                    evaluation_error_mask(mapped_base, scene["label"]),
+                    MASK_COLORS["error"],
+                ),
+                f"Frozen error 0/1\n1: {100.0 * evaluation_error_ratio(mapped_base, scene['label']):.2f}%",
+            ),
+            (
+                binary_colors(
+                    scene["split_refiner"] != scene["base"],
+                    MASK_COLORS["refiner_change"],
+                ),
+                f"Refiner change 0/1\n1: {100.0 * scene['refiner_changed_ratio']:.2f}%",
+            ),
+            (
+                binary_colors(
+                    evaluation_error_mask(mapped_refiner, scene["label"]),
+                    MASK_COLORS["error"],
+                ),
+                f"Refiner error 0/1\n1: {100.0 * evaluation_error_ratio(mapped_refiner, scene['label']):.2f}%",
+            ),
+            (
+                binary_colors(
+                    scene["meta"] != scene["split_refiner"],
+                    MASK_COLORS["meta_change"],
+                ),
+                f"Meta change 0/1\n1: {100.0 * scene['meta_changed_ratio']:.2f}%",
+            ),
+            (
+                binary_colors(
+                    evaluation_error_mask(mapped_meta, scene["label"]),
+                    MASK_COLORS["error"],
+                ),
+                f"Meta error 0/1\n1: {100.0 * evaluation_error_ratio(mapped_meta, scene['label']):.2f}%",
+            ),
+        )
+        for column, (colors, title) in enumerate(diagnostic_panels):
+            draw_points(
+                diagnostic_axes[row, column],
+                scene["xyz"],
+                colors,
+                title,
+            )
+        diagnostic_axes[row, 0].text(
+            -0.04,
+            0.5,
+            f"{scene['name'].lstrip('/')}\n[{room_type(scene['name'])}]",
+            transform=diagnostic_axes[row, 0].transAxes,
+            rotation=90,
+            va="center",
+            ha="right",
+            fontsize=8,
+            fontweight="bold",
+        )
+    diagnostic_figure.suptitle(
+        "Original-Point 0/1 Diagnostics (1 = Highlighted)",
+        fontsize=12,
+        fontweight="bold",
+    )
+    diagnostic_figure.tight_layout(
+        rect=[0.025, 0, 1, 0.965],
+        w_pad=0.2,
+        h_pad=0.55,
+    )
+    diagnostic_path = os.path.join(
+        args.output_dir,
+        f"qualitative_{args.selection}_{rows}_binary01.png",
+    )
+    diagnostic_figure.savefig(
+        diagnostic_path,
+        bbox_inches="tight",
+        facecolor="white",
+    )
+    plt.close(diagnostic_figure)
+
     summary = []
     for scene in selected:
         summary.append(
             {
                 "scene": scene["name"],
+                "room_type": room_type(scene["name"]),
                 "points": int(len(scene["xyz"])),
                 "base_point_accuracy": scene["base_acc"],
                 "split_refiner_point_accuracy": scene["refiner_acc"],
@@ -497,6 +746,7 @@ def main():
                 "meta_gain_percentage_points": 100.0 * scene["meta_gain"],
                 "suspicious_ratio": float(scene["refine_mask"].mean()),
                 "split_ratio": float(scene["split_mask"].mean()),
+                "refiner_changed_ratio": scene["refiner_changed_ratio"],
                 "meta_changed_ratio": float(
                     scene["meta_changed_ratio"]
                 ),
@@ -527,6 +777,7 @@ def main():
             [
                 {
                     "scene": scene["name"],
+                    "room_type": room_type(scene["name"]),
                     "points": int(len(scene["xyz"])),
                     "base_point_accuracy": scene["base_acc"],
                     "split_refiner_point_accuracy": scene["refiner_acc"],
@@ -534,6 +785,7 @@ def main():
                     "refiner_gain_percentage_points": 100.0
                     * scene["refiner_gain"],
                     "meta_gain_percentage_points": 100.0 * scene["meta_gain"],
+                    "refiner_changed_ratio": scene["refiner_changed_ratio"],
                     "meta_changed_ratio": scene["meta_changed_ratio"],
                     "meta_accepted": scene["meta_accepted"],
                     "meta_query_gain": scene["meta_stats"]["query_gain"],
@@ -549,6 +801,7 @@ def main():
         )
     print(json.dumps(summary, indent=2))
     print(f"Saved {figure_path}")
+    print(f"Saved {diagnostic_path}")
     print(f"Saved {summary_path}")
     print(f"Saved {all_scene_path}")
 

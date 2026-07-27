@@ -47,7 +47,11 @@ These values are PyTorch CUDA allocator measurements and exclude the CUDA contex
 
 ## Qualitative Results
 
-The qualitative comparison contains four columns:
+All predictions and masks are projected from voxel predictions back to the
+complete raw PLY point cloud through the dataset inverse map. Exported XYZ uses
+the raw per-point coordinates rather than repeated voxel centers; original RGB
+is retained in every binary PLY alongside the visualization colors. The main
+comparison contains four columns:
 
 1. frozen backbone prediction;
 2. detected semantic-difference regions and split regions;
@@ -56,14 +60,32 @@ The qualitative comparison contains four columns:
 
 Non-suspicious points are gray in the second column. Red points are semantic-difference regions, while colored subsets show split targets. Green outlines in the final column indicate points changed by Meta adaptation relative to the Refiner.
 
-![Meta-Refiner positive examples](assets/meta_refiner_qualitative_success.png)
+![Original-point qualitative comparison](assets/meta_refiner_qualitative_original_points.png)
 
-The two positive examples are:
+The selected examples prioritize different room types instead of repeatedly
+showing offices:
 
 | Scene | Refiner gain over frozen | Meta gain over Refiner | Meta changed points |
 |---|---:|---:|---:|
-| Area_5_office_12 | +7.16 pp | **+0.97 pp** | 1.72% |
-| Area_5_office_42 | -0.45 pp | **+0.61 pp** | 3.97% |
+| Area_5_office_12 | +7.16 pp | **+0.97 pp** | 1.54% |
+| Area_5_storage_2 | +3.37 pp | **+0.65 pp** | 0.55% |
+| Area_5_hallway_13 | +0.87 pp | -0.01 pp | 0.22% |
+
+The following high-contrast diagnostic uses explicit binary scalar fields.
+Orange denotes detected semantic difference, blue denotes points changed by
+the Refiner, purple denotes points changed by Meta adaptation, and red denotes
+evaluation errors. Gray always means zero. The percentages in error columns
+are computed over valid evaluation points only.
+
+![Original-point binary diagnostics](assets/meta_refiner_qualitative_binary01.png)
+
+The binary view separates two questions that semantic prediction colors tend
+to obscure: where the method chooses to intervene, and whether the final
+prediction is correct. Ground-truth-derived error masks are visualization-only;
+they are never supplied to semantic-difference detection, refinement, Meta
+adaptation, or verification.
+
+### Additional Failure Analysis
 
 The mixed diagnostic figure additionally contains a failure case:
 
@@ -80,7 +102,7 @@ Ground truth is used only for a single global semantic-slot alignment, per-scene
 The complete PLY outputs are stored under:
 
 ```text
-ckpt/S3DIS/meta_refiner/qualitative_active/
+ckpt/S3DIS/meta_refiner/qualitative_original01_diverse_full/
 ```
 
 Each selected scene contains:
@@ -90,9 +112,20 @@ frozen_prediction.ply
 semantic_difference_split.ply
 split_refiner.ply
 meta_adaptation.ply
+semantic_difference_01.ply
+split_target_01.ply
+frozen_error_01.ply
+refiner_change_01.ply
+refiner_error_01.ply
+meta_change_01.ply
+meta_error_01.ply
 ```
 
-The PLY files contain XYZ, RGB visualization colors, and prediction or suspicious/split attributes, and can be opened directly in CloudCompare or Open3D.
+Every `*_01.ply` contains original XYZ, high-contrast visualization RGB,
+original RGB, and an integer `value_01` field. This allows CloudCompare to
+filter or recolor points directly by the binary scalar. Error files use ground
+truth for evaluation visualization only; change and semantic-difference files
+remain label-free.
 
 ## Reproduction
 
@@ -111,5 +144,5 @@ env CUDA_VISIBLE_DEVICES=1 MPLCONFIGDIR=/tmp/matplotlib-meta-refiner \
   --selection mixed \
   --num_scenes 3 \
   --workers 4 \
-  --output_dir ckpt/S3DIS/meta_refiner/qualitative_active
+  --output_dir ckpt/S3DIS/meta_refiner/qualitative_original01_diverse_full
 ```
