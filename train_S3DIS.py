@@ -609,7 +609,7 @@ def train(
 
         if learnable_sp is not None:
             learnable_sp_output = learnable_sp(
-                feats,
+                feats.detach(),
                 point_coords,
                 point_colors,
                 semantic_logits * args.learnable_sp_query_scale,

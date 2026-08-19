@@ -37,8 +37,10 @@ the second round onward.
 ## Objectives
 
 The structure learner uses label-free feature compactness, geometric
-compactness, semantic compactness, assignment entropy, and child balance. Only
-verified child consensus is converted into semantic supervision. Ground-truth
+compactness, semantic compactness, assignment entropy, and child balance.
+Structural gradients update the assignment module without directly pulling the
+backbone away from its primitive-clustering objective. Only verified child
+consensus can be converted into optional semantic supervision. Ground-truth
 labels are never read by candidate discovery, assignment, verification, or
 training loss.
 
