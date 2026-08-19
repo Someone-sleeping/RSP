@@ -11,6 +11,10 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from models.fpn import Res16FPN18
 from models.query_refiner import ErrorQueryRefiner, refined_cross_entropy, refinement_keep_kl, delta_l2
+from models.learnable_superpoint import (
+    SemanticDifferenceSuperpointLearner,
+    verified_region_supervision_loss,
+)
 from eval_S3DIS import eval
 from lib.utils import get_pseudo, get_sp_feature, get_fixclassifier
 from lib.error_query import build_error_queries
@@ -102,6 +106,25 @@ def parse_args():
     parser.add_argument('--refine_teacher_epoch', type=int, default=-1, help='teacher checkpoint epoch; -1 uses the latest epoch with both model and cls checkpoints')
     parser.add_argument('--refine_freeze_backbone', action='store_true', default=False, help='freeze GrowSP backbone and optimize only the refiner')
     parser.add_argument('--refine_teacher_growsp', type=int, default=-1, help='superpoint target used to generate frozen-teacher pseudo labels; -1 uses growsp_end')
+    parser.add_argument('--learnable_sp_enable', action='store_true', default=False,
+                        help='learn candidate superpoint structure inside unsupervised training')
+    parser.add_argument('--learnable_sp_lr', type=float, default=1e-3, help='learning rate for superpoint assignment')
+    parser.add_argument('--learnable_sp_weight_decay', type=float, default=1e-4, help='weight decay for superpoint assignment')
+    parser.add_argument('--learnable_sp_hidden_dim', type=int, default=64, help='hidden dimension for superpoint assignment')
+    parser.add_argument('--learnable_sp_iterations', type=int, default=3, help='soft center update iterations')
+    parser.add_argument('--learnable_sp_temperature', type=float, default=0.2, help='soft assignment temperature')
+    parser.add_argument('--learnable_sp_query_scale', type=float, default=10.0,
+                        help='logit scale used only to discover and verify dynamic regions')
+    parser.add_argument('--learnable_sp_structure_lambda', type=float, default=0.1, help='structural objective weight')
+    parser.add_argument('--learnable_sp_supervision_lambda', type=float, default=0.2, help='verified region supervision weight')
+    parser.add_argument('--learnable_sp_min_region_points', type=int, default=20, help='minimum candidate parent size')
+    parser.add_argument('--learnable_sp_min_child_points', type=int, default=6, help='minimum verified child size')
+    parser.add_argument('--learnable_sp_max_regions', type=int, default=12, help='maximum candidate parents per scene')
+    parser.add_argument('--learnable_sp_purity_th', type=float, default=0.9, help='candidate semantic purity threshold')
+    parser.add_argument('--learnable_sp_entropy_th', type=float, default=0.3, help='candidate normalized entropy threshold')
+    parser.add_argument('--learnable_sp_child_conf_th', type=float, default=0.2, help='minimum child consensus confidence')
+    parser.add_argument('--learnable_sp_conf_gain', type=float, default=0.01, help='minimum child confidence gain')
+    parser.add_argument('--learnable_sp_semantic_sep', type=float, default=0.15, help='minimum child semantic separation')
     return parser.parse_args()
 
 
@@ -129,6 +152,7 @@ def main(args, logger):
     logger.info(f"DOUBEL_SSL(多模自监督) set to: {args.double_ssl}")
     logger.info(f"REFINE_ENABLE(error-query refinement) set to: {args.refine_enable}")
     logger.info(f"REFINE_FREEZE_BACKBONE set to: {args.refine_freeze_backbone}")
+    logger.info(f"LEARNABLE_SP_ENABLE(training-integrated structure) set to: {args.learnable_sp_enable}")
     logger.info("------------------------------")
     backup_selected(args)
     all_areas = ['Area_1', 'Area_2', 'Area_3', 'Area_4', 'Area_5', 'Area_6']
@@ -160,6 +184,16 @@ def main(args, logger):
             dropout=args.refine_dropout,
         ).cuda()
         logger.info(refiner)
+    learnable_sp = None
+    if args.learnable_sp_enable:
+        learnable_sp = SemanticDifferenceSuperpointLearner(
+            feat_dim=args.feats_dim,
+            num_classes=args.semantic_class,
+            hidden_dim=args.learnable_sp_hidden_dim,
+            iterations=args.learnable_sp_iterations,
+            temperature=args.learnable_sp_temperature,
+        ).cuda()
+        logger.info(learnable_sp)
 
     optimizer = None
     if not args.refine_freeze_backbone:
@@ -167,8 +201,18 @@ def main(args, logger):
     refiner_optimizer = None
     if refiner is not None:
         refiner_optimizer = torch.optim.AdamW(refiner.parameters(), lr=args.refine_lr, weight_decay=args.refine_weight_decay)
+    learnable_sp_optimizer = None
+    if learnable_sp is not None:
+        learnable_sp_optimizer = torch.optim.AdamW(
+            learnable_sp.parameters(),
+            lr=args.learnable_sp_lr,
+            weight_decay=args.learnable_sp_weight_decay,
+        )
     scheduler = None if optimizer is None else PolyLR(optimizer, max_iter=args.max_iter[0])
-    start_epoch, start_grow_epoch, is_Growing = load_resume_checkpoint(args, model, optimizer, scheduler, logger, refiner=refiner)
+    start_epoch, start_grow_epoch, is_Growing = load_resume_checkpoint(
+        args, model, optimizer, scheduler, logger, refiner=refiner,
+        learnable_sp=learnable_sp, learnable_sp_optimizer=learnable_sp_optimizer,
+    )
     teacher_classifier = None
     if args.refine_teacher_ckpt_dir:
         teacher_classifier, teacher_epoch = load_frozen_teacher(args, model, logger)
@@ -179,9 +223,14 @@ def main(args, logger):
         start_grow_epoch = 0
     if is_Growing and optimizer is not None:
         scheduler = PolyLR(optimizer, max_iter=args.max_iter[1])
-        start_epoch, start_grow_epoch, is_Growing = load_resume_checkpoint(args, model, optimizer, scheduler, logger, refiner=refiner)
+        start_epoch, start_grow_epoch, is_Growing = load_resume_checkpoint(
+            args, model, optimizer, scheduler, logger, refiner=refiner,
+            learnable_sp=learnable_sp, learnable_sp_optimizer=learnable_sp_optimizer,
+        )
 
     loss = torch.nn.CrossEntropyLoss(ignore_index=-1).cuda()
+    classifier = None
+    primitive_to_semantic = None
 
     '''Train and Cluster'''
     '''Superpoints will not Grow in 1st Stage'''
@@ -192,15 +241,21 @@ def main(args, logger):
             classifier, primitive_to_semantic = cluster(
                 args, logger, cluster_loader, model, epoch, start_grow_epoch, is_Growing,
                 teacher_classifier=teacher_classifier,
+                structure_classifier=classifier, structure_mapping=primitive_to_semantic,
+                learnable_sp=learnable_sp,
             )
             refiner_optimizer = maybe_reset_refiner(args, refiner, logger)
         train(
             train_loader, logger, model, optimizer, loss, epoch, scheduler, classifier, primitive_to_semantic,
             refiner=refiner, refiner_optimizer=refiner_optimizer, freeze_backbone=args.refine_freeze_backbone,
+            learnable_sp=learnable_sp, learnable_sp_optimizer=learnable_sp_optimizer,
         )
 
         if epoch % 10 == 0:
-            save_checkpoints(args, epoch, model, optimizer, scheduler, classifier, is_Growing, start_grow_epoch, logger, refiner=refiner)
+            save_checkpoints(
+                args, epoch, model, optimizer, scheduler, classifier, is_Growing, start_grow_epoch, logger,
+                refiner=refiner, learnable_sp=learnable_sp, learnable_sp_optimizer=learnable_sp_optimizer,
+            )
             with torch.no_grad():
                 o_Acc, m_Acc, s = eval(epoch, args, test_areas)
                 logger.info('Epoch: {:02d}, oAcc {:.2f}  mAcc {:.2f} IoUs'.format(epoch, o_Acc, m_Acc) + s)
@@ -227,15 +282,21 @@ def main(args, logger):
             classifier, primitive_to_semantic = cluster(
                 args, logger, cluster_loader, model, epoch, start_grow_epoch, is_Growing,
                 teacher_classifier=teacher_classifier,
+                structure_classifier=classifier, structure_mapping=primitive_to_semantic,
+                learnable_sp=learnable_sp,
             )
             refiner_optimizer = maybe_reset_refiner(args, refiner, logger)
         train(
             train_loader, logger, model, optimizer, loss, epoch, scheduler, classifier, primitive_to_semantic,
             refiner=refiner, refiner_optimizer=refiner_optimizer, freeze_backbone=args.refine_freeze_backbone,
+            learnable_sp=learnable_sp, learnable_sp_optimizer=learnable_sp_optimizer,
         )
 
         if epoch % 10 == 0:
-            save_checkpoints(args, epoch, model, optimizer, scheduler, classifier, is_Growing, start_grow_epoch, logger, refiner=refiner)
+            save_checkpoints(
+                args, epoch, model, optimizer, scheduler, classifier, is_Growing, start_grow_epoch, logger,
+                refiner=refiner, learnable_sp=learnable_sp, learnable_sp_optimizer=learnable_sp_optimizer,
+            )
             with torch.no_grad():
                 o_Acc, m_Acc, s = eval(epoch, args, test_areas)
                 logger.info('Epoch: {:02d}, oAcc {:.2f}  mAcc {:.2f} IoUs'.format(epoch, o_Acc, m_Acc) + s)
@@ -296,7 +357,10 @@ def freeze_backbone(model):
     model.eval()
 
 
-def cluster(args, logger, cluster_loader, model, epoch, start_grow_epoch=None, is_Growing=False, teacher_classifier=None):
+def cluster(
+    args, logger, cluster_loader, model, epoch, start_grow_epoch=None, is_Growing=False,
+    teacher_classifier=None, structure_classifier=None, structure_mapping=None, learnable_sp=None,
+):
     time_start = time.time()
     cluster_loader.dataset.mode = 'cluster'
 
@@ -313,7 +377,31 @@ def cluster(args, logger, cluster_loader, model, epoch, start_grow_epoch=None, i
         logger.info('Epoch: {}, Superpoints Grow to {}'.format(epoch, current_growsp))
 
     '''Extract Superpoints Feature'''
-    feats, labels, sp_index, context = get_sp_feature(args, cluster_loader, model, current_growsp)
+    structure_centers = None
+    if learnable_sp is not None and structure_classifier is not None and structure_mapping is not None:
+        structure_centers = build_semantic_classifier(
+            structure_classifier, structure_mapping, args.semantic_class
+        )
+    feats, labels, sp_index, context = get_sp_feature(
+        args,
+        cluster_loader,
+        model,
+        current_growsp,
+        learnable_sp=learnable_sp,
+        semantic_centers=structure_centers,
+    )
+    structure_stats = getattr(args, 'cluster_learnable_sp_stats', None)
+    if structure_stats and structure_stats['scenes'] > 0:
+        coverage = structure_stats['supervised_points'] / max(structure_stats['valid_points'], 1)
+        logger.info(
+            'Epoch: {}, learned structure reclustering: scenes {}, candidates {}, accepted {}, coverage {:.2f}%'.format(
+                epoch,
+                structure_stats['scenes'],
+                structure_stats['candidate_regions'],
+                structure_stats['accepted_splits'],
+                100 * coverage,
+            )
+        )
     sp_feats = torch.cat(feats, dim=0)### will do Kmeans with geometric distance
     sp_feats_rgb = sp_feats[:, args.feats_dim:args.feats_dim+3]
     if teacher_classifier is not None:
@@ -461,7 +549,11 @@ def smooth_targets_by_region(targets, regions, refine_mask, ignore_index=-1):
     return smoothed
 
 
-def train(train_loader, logger, model, optimizer, loss, epoch, scheduler, classifier, primitive_to_semantic, refiner=None, refiner_optimizer=None, freeze_backbone=False):
+def train(
+    train_loader, logger, model, optimizer, loss, epoch, scheduler, classifier, primitive_to_semantic,
+    refiner=None, refiner_optimizer=None, freeze_backbone=False,
+    learnable_sp=None, learnable_sp_optimizer=None,
+):
     train_loader.dataset.mode = 'train'
     if freeze_backbone:
         model.eval()
@@ -469,13 +561,15 @@ def train(train_loader, logger, model, optimizer, loss, epoch, scheduler, classi
         model.train()
     if refiner is not None:
         refiner.train()
+    if learnable_sp is not None:
+        learnable_sp.train()
     loss_display = 0
     time_curr = time.time()
 
     losses_display = {}
     loss = setup_loss_weight(args, loss)
     semantic_centers = None
-    if refiner is not None:
+    if refiner is not None or learnable_sp is not None:
         semantic_centers = build_semantic_classifier(classifier, primitive_to_semantic, args.semantic_class)
     for batch_idx, data in enumerate(train_loader):
         losses = {}
@@ -498,18 +592,72 @@ def train(train_loader, logger, model, optimizer, loss, epoch, scheduler, classi
         logits = F.linear(F.normalize(feats), F.normalize(classifier.weight))
         loss_sem = loss(logits * 3, pseudo_labels_comp).mean()
 
-        loss_refine = None
-        if refiner is not None:
+        point_coords = None
+        point_batch_ids = None
+        point_colors = None
+        point_regions = region.squeeze(-1).long().cuda()
+        semantic_targets = None
+        semantic_logits = None
+        dynamic_regions = point_regions
+        learnable_sp_output = None
+        if refiner is not None or learnable_sp is not None:
             point_coords = coords[inds.long(), 1:].float().cuda()
             point_batch_ids = coords[inds.long(), 0].long().cuda()
             point_colors = features[inds.long(), :3].float().cuda()
             semantic_targets = primitive_targets_to_semantic(pseudo_labels_comp, primitive_to_semantic)
-            logits_for_refine = F.linear(F.normalize(feats), semantic_centers).detach()
+            semantic_logits = F.linear(F.normalize(feats), semantic_centers)
+
+        if learnable_sp is not None:
+            learnable_sp_output = learnable_sp(
+                feats,
+                point_coords,
+                point_colors,
+                semantic_logits * args.learnable_sp_query_scale,
+                point_regions,
+                point_batch_ids,
+                min_region_points=args.learnable_sp_min_region_points,
+                min_child_points=args.learnable_sp_min_child_points,
+                max_regions_per_scene=args.learnable_sp_max_regions,
+                purity_threshold=args.learnable_sp_purity_th,
+                entropy_threshold=args.learnable_sp_entropy_th,
+                min_child_confidence=args.learnable_sp_child_conf_th,
+                min_confidence_gain=args.learnable_sp_conf_gain,
+                min_semantic_separation=args.learnable_sp_semantic_sep,
+            )
+            dynamic_regions = learnable_sp_output.dynamic_regions
+            loss_sp_supervision = verified_region_supervision_loss(semantic_logits * 3, learnable_sp_output)
+            losses['loss_learnable_sp_structure'] = (
+                args.learnable_sp_structure_lambda * learnable_sp_output.structure_loss
+            )
+            losses['loss_learnable_sp_supervision'] = (
+                args.learnable_sp_supervision_lambda * loss_sp_supervision
+            )
+            losses['learnable_sp_feature'] = learnable_sp_output.feature_loss
+            losses['learnable_sp_geometry'] = learnable_sp_output.geometry_loss
+            losses['learnable_sp_semantic'] = learnable_sp_output.semantic_loss
+            losses['learnable_sp_candidates'] = logits.new_tensor(
+                float(learnable_sp_output.stats['selected_regions'])
+            )
+            losses['learnable_sp_accepted'] = logits.new_tensor(
+                float(learnable_sp_output.stats['accepted_splits'])
+            )
+            losses['learnable_sp_supervised'] = logits.new_tensor(
+                learnable_sp_output.stats['supervised_ratio']
+            )
+            if learnable_sp_output.supervision_mask.any():
+                semantic_targets = semantic_targets.clone()
+                semantic_targets[learnable_sp_output.supervision_mask] = (
+                    learnable_sp_output.supervision_targets[learnable_sp_output.supervision_mask]
+                )
+
+        loss_refine = None
+        if refiner is not None:
+            logits_for_refine = semantic_logits.detach()
             feats_for_refine = feats.detach()
             query_indices, refine_mask, keep_mask, query_stats = build_error_queries(
                 logits_for_refine * args.refine_query_scale,
                 semantic_targets,
-                region.cuda(),
+                dynamic_regions,
                 point_batch_ids,
                 point_coords,
                 colors=point_colors,
@@ -523,8 +671,7 @@ def train(train_loader, logger, model, optimizer, loss, epoch, scheduler, classi
             )
             delta_logits = refiner(feats_for_refine, point_coords, point_batch_ids, query_indices)
             refined_logits = logits_for_refine + args.refine_residual_scale * delta_logits
-            point_regions = region.squeeze(-1).long().cuda()
-            refine_targets = smooth_targets_by_region(semantic_targets, point_regions, refine_mask)
+            refine_targets = smooth_targets_by_region(semantic_targets, dynamic_regions, refine_mask)
             loss_refine_ce = refined_cross_entropy(refined_logits * 3, refine_targets, refine_mask)
             loss_keep = refinement_keep_kl(refined_logits * 3, logits_for_refine * 3, keep_mask)
             loss_delta = delta_l2(delta_logits, refine_mask | keep_mask)
@@ -562,10 +709,16 @@ def train(train_loader, logger, model, optimizer, loss, epoch, scheduler, classi
             else:
                 losses_display[k] = losses[k].item()
 
-        if not freeze_backbone and optimizer is not None:
+        if optimizer is not None:
             optimizer.zero_grad()
+        if learnable_sp_optimizer is not None:
+            learnable_sp_optimizer.zero_grad()
+        if (not freeze_backbone and optimizer is not None) or learnable_sp_optimizer is not None:
             loss_all.backward() 
+        if not freeze_backbone and optimizer is not None:
             optimizer.step()
+        if learnable_sp_optimizer is not None:
+            learnable_sp_optimizer.step()
         if refiner is not None and refiner_optimizer is not None and loss_refine is not None:
             refiner_optimizer.zero_grad()
             (args.refine_lambda * loss_refine).backward()

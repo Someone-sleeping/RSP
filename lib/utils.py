@@ -9,7 +9,10 @@ import MinkowskiEngine as ME
 from tqdm import tqdm
 from .my_utils import VisualizationThreadPool
 
-def get_sp_feature(args, loader, model, current_growsp, vis=False):
+def get_sp_feature(
+    args, loader, model, current_growsp, vis=False,
+    learnable_sp=None, semantic_centers=None,
+):
     print('computing point feats ....')
     point_feats_list = []
     point_labels_list = []
@@ -18,6 +21,15 @@ def get_sp_feature(args, loader, model, current_growsp, vis=False):
     context = []
     if vis:
         vis_pool = VisualizationThreadPool(max_threads=4)
+    structure_stats = {
+        'scenes': 0,
+        'candidate_regions': 0,
+        'accepted_splits': 0,
+        'supervised_points': 0,
+        'valid_points': 0,
+    }
+    if learnable_sp is not None:
+        learnable_sp.eval()
     with torch.no_grad():
         for batch_idx, data in enumerate(loader):
             coords, features, normals, labels, inverse_map, pseudo_labels, inds, region, index = data
@@ -45,6 +57,30 @@ def get_sp_feature(args, loader, model, current_growsp, vis=False):
             ##
             pc_rgb = features[:, 0:3]
             pc_xyz = features[:, 3:] * args.voxel_size
+            if learnable_sp is not None and semantic_centers is not None:
+                semantic_logits = F.linear(F.normalize(feats, dim=1), semantic_centers)
+                structure_output = learnable_sp(
+                    feats,
+                    pc_xyz,
+                    pc_rgb,
+                    semantic_logits * getattr(args, 'learnable_sp_query_scale', 10.0),
+                    region,
+                    torch.zeros(region.size(0), dtype=torch.long, device=feats.device),
+                    min_region_points=getattr(args, 'learnable_sp_min_region_points', 20),
+                    min_child_points=getattr(args, 'learnable_sp_min_child_points', 6),
+                    max_regions_per_scene=getattr(args, 'learnable_sp_max_regions', 12),
+                    purity_threshold=getattr(args, 'learnable_sp_purity_th', 0.9),
+                    entropy_threshold=getattr(args, 'learnable_sp_entropy_th', 0.3),
+                    min_child_confidence=getattr(args, 'learnable_sp_child_conf_th', 0.2),
+                    min_confidence_gain=getattr(args, 'learnable_sp_conf_gain', 0.01),
+                    min_semantic_separation=getattr(args, 'learnable_sp_semantic_sep', 0.15),
+                )
+                region = structure_output.dynamic_regions.cpu()
+                structure_stats['scenes'] += 1
+                structure_stats['candidate_regions'] += structure_output.stats['selected_regions']
+                structure_stats['accepted_splits'] += structure_output.stats['accepted_splits']
+                structure_stats['supervised_points'] += int(structure_output.supervision_mask.sum().item())
+                structure_stats['valid_points'] += int(region.numel())
             ##
             region_num = len(torch.unique(region))
             region_corr = torch.zeros(region.size(0), region_num)#?
@@ -153,6 +189,7 @@ def get_sp_feature(args, loader, model, current_growsp, vis=False):
 
             torch.cuda.empty_cache()
             torch.cuda.synchronize(torch.device("cuda"))
+    args.cluster_learnable_sp_stats = structure_stats
     return point_feats_list, point_labels_list, all_sp_index, context
 
 

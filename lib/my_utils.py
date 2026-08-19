@@ -262,7 +262,10 @@ def backup_selected(args):
         json.dump(args, f, indent=4, ensure_ascii=False)
 
 
-def load_resume_checkpoint(args, model, optimizer, scheduler, logger, refiner=None):
+def load_resume_checkpoint(
+    args, model, optimizer, scheduler, logger, refiner=None,
+    learnable_sp=None, learnable_sp_optimizer=None,
+):
     """处理模型断点续传，返回当前 epoch 和阶段控制参数"""
     if not args.resume:
         return 0, 0, False  # start_epoch, start_grow_epoch, is_Growing
@@ -277,6 +280,14 @@ def load_resume_checkpoint(args, model, optimizer, scheduler, logger, refiner=No
                 logger.info(f"Refiner state was not restored: {exc}")
         else:
             logger.info("Resume checkpoint has no refiner_state_dict; initializing refiner from scratch.")
+    if learnable_sp is not None:
+        if 'learnable_sp_state_dict' in checkpoint:
+            try:
+                learnable_sp.load_state_dict(checkpoint['learnable_sp_state_dict'])
+            except RuntimeError as exc:
+                logger.info(f"Learnable superpoint state was not restored: {exc}")
+        else:
+            logger.info("Resume checkpoint has no learnable_sp_state_dict; initializing it from scratch.")
     if optimizer is not None and 'optimizer_state_dict' in checkpoint:
         try:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -287,6 +298,11 @@ def load_resume_checkpoint(args, model, optimizer, scheduler, logger, refiner=No
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         except ValueError as exc:
             logger.info(f"Scheduler state was not restored: {exc}")
+    if learnable_sp_optimizer is not None and 'learnable_sp_optimizer_state_dict' in checkpoint:
+        try:
+            learnable_sp_optimizer.load_state_dict(checkpoint['learnable_sp_optimizer_state_dict'])
+        except ValueError as exc:
+            logger.info(f"Learnable superpoint optimizer state was not restored: {exc}")
 
     start_epoch = checkpoint.get('epoch', 0)
     is_Growing = checkpoint.get('is_Growing', False)
@@ -298,7 +314,10 @@ def load_resume_checkpoint(args, model, optimizer, scheduler, logger, refiner=No
     return start_epoch, start_grow_epoch, is_Growing
 
 
-def save_checkpoints(args, epoch, model, optimizer, scheduler, classifier, is_Growing, start_grow_epoch, logger, refiner=None):
+def save_checkpoints(
+    args, epoch, model, optimizer, scheduler, classifier, is_Growing, start_grow_epoch, logger,
+    refiner=None, learnable_sp=None, learnable_sp_optimizer=None,
+):
     """一键保存所有 Checkpoints，并自动兼容处理不存在的路径"""
 
     # 自动检查并创建 ckpts 文件夹
@@ -319,6 +338,10 @@ def save_checkpoints(args, epoch, model, optimizer, scheduler, classifier, is_Gr
         state['scheduler_state_dict'] = scheduler.state_dict()
     if refiner is not None:
         state['refiner_state_dict'] = refiner.state_dict()
+    if learnable_sp is not None:
+        state['learnable_sp_state_dict'] = learnable_sp.state_dict()
+    if learnable_sp_optimizer is not None:
+        state['learnable_sp_optimizer_state_dict'] = learnable_sp_optimizer.state_dict()
 
     # 使用上一步定义好的 ckpt_dir，代码更干净
     resume_path = os.path.join(ckpt_dir, f'model_{epoch}_resume.pth')
@@ -337,6 +360,9 @@ def save_checkpoints(args, epoch, model, optimizer, scheduler, classifier, is_Gr
     if refiner is not None:
         torch.save(refiner.state_dict(), os.path.join(ckpt_dir, f'refiner_{epoch}_checkpoint.pth'))
         torch.save(refiner.state_dict(), os.path.join(args.save_path, f'refiner_{epoch}_checkpoint.pth'))
+    if learnable_sp is not None:
+        torch.save(learnable_sp.state_dict(), os.path.join(ckpt_dir, f'learnable_sp_{epoch}_checkpoint.pth'))
+        torch.save(learnable_sp.state_dict(), os.path.join(args.save_path, f'learnable_sp_{epoch}_checkpoint.pth'))
 
 
 def compute_type1_centers(sp_feats, primitive_labels, primitive_centers, args, logger, sp_feats_rgb, sp_feats_region_num=None):
