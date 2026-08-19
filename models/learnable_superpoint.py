@@ -138,31 +138,57 @@ class SemanticDifferenceSuperpointLearner(nn.Module):
         predictions = probabilities.argmax(dim=1)
         entropy = -(probabilities * probabilities.clamp_min(1e-6).log()).sum(dim=1)
         entropy = entropy / max(math.log(probabilities.size(1)), 1e-6)
-        selected = []
+        valid = regions >= 0
+        base_regions = torch.full_like(regions, -1)
+        if not valid.any():
+            return [], torch.zeros_like(valid), 0, base_regions, 0
+
+        region_pairs, inverse = torch.unique(
+            torch.stack([batch_ids[valid], regions[valid]], dim=1),
+            dim=0,
+            sorted=True,
+            return_inverse=True,
+        )
+        base_regions[valid] = inverse
+        region_count = region_pairs.size(0)
+        counts = torch.bincount(inverse, minlength=region_count).float()
+        entropy_sum = entropy.new_zeros(region_count)
+        entropy_sum.index_add_(0, inverse, entropy[valid])
+        region_entropy = entropy_sum / counts.clamp_min(1.0)
+
+        class_counts = probabilities.new_zeros((region_count, probabilities.size(1)))
+        class_counts.index_put_(
+            (inverse, predictions[valid]),
+            torch.ones_like(inverse, dtype=probabilities.dtype),
+            accumulate=True,
+        )
+        purity = class_counts.max(dim=1)[0] / counts.clamp_min(1.0)
+        candidate = (
+            (counts >= min_region_points)
+            & ((purity < purity_threshold) | (region_entropy > entropy_threshold))
+        )
+        score = (1.0 - purity) + region_entropy
+
+        selected_region_ids = []
+        for batch_id in torch.unique(region_pairs[:, 0]):
+            scene_candidates = torch.nonzero(
+                candidate & (region_pairs[:, 0] == batch_id), as_tuple=False
+            ).flatten()
+            if scene_candidates.numel() == 0:
+                continue
+            keep = min(max_regions_per_scene, scene_candidates.numel())
+            order = torch.topk(score[scene_candidates], k=keep, largest=True).indices
+            selected_region_ids.append(scene_candidates[order])
+
         candidate_mask = torch.zeros_like(regions, dtype=torch.bool)
-        candidate_count = 0
-        for batch_id in torch.unique(batch_ids):
-            scene_mask = batch_ids == batch_id
-            candidates = []
-            for region_id in torch.unique(regions[scene_mask]):
-                if int(region_id.item()) < 0:
-                    continue
-                mask = scene_mask & (regions == region_id)
-                if int(mask.sum().item()) < min_region_points:
-                    continue
-                _, counts = torch.unique(predictions[mask], return_counts=True)
-                purity = counts.max().float() / mask.sum().float()
-                region_entropy = entropy[mask].mean()
-                if purity >= purity_threshold and region_entropy <= entropy_threshold:
-                    continue
-                score = (1.0 - purity) + region_entropy
-                candidates.append((float(score.item()), mask))
-            candidates.sort(key=lambda item: item[0], reverse=True)
-            candidate_count += len(candidates)
-            for _, mask in candidates[:max_regions_per_scene]:
+        selected = []
+        if selected_region_ids:
+            selected_region_ids = torch.cat(selected_region_ids)
+            for region_id in selected_region_ids:
+                mask = base_regions == region_id
                 candidate_mask[mask] = True
                 selected.append(mask)
-        return selected, candidate_mask, candidate_count
+        return selected, candidate_mask, int(candidate.sum().item()), base_regions, region_count
 
     @staticmethod
     def _weighted_compactness(values, assignment, centers=None):
@@ -196,7 +222,7 @@ class SemanticDifferenceSuperpointLearner(nn.Module):
         batch_ids = batch_ids.to(device).long().view(-1)
         probabilities = F.softmax(semantic_logits.detach(), dim=1)
 
-        selected, candidate_mask, candidate_count = self._candidate_regions(
+        selected, candidate_mask, candidate_count, base_regions, base_region_count = self._candidate_regions(
             probabilities,
             regions,
             batch_ids,
@@ -206,7 +232,7 @@ class SemanticDifferenceSuperpointLearner(nn.Module):
             max_regions_per_scene,
         )
 
-        dynamic_regions = torch.full_like(regions, -1)
+        dynamic_regions = base_regions.clone()
         supervision_targets = torch.full_like(regions, -1)
         supervision_confidence = semantic_logits.new_zeros(regions.shape)
         supervision_mask = torch.zeros_like(regions, dtype=torch.bool)
@@ -289,28 +315,10 @@ class SemanticDifferenceSuperpointLearner(nn.Module):
             + self.balance_weight * losses["balance"]
         )
 
-        next_region = 0
-        accepted_by_point = {}
+        next_region = base_region_count
         for indices, hard_assignment in accepted_children:
-            for point_index, child_id in zip(indices.tolist(), hard_assignment.tolist()):
-                accepted_by_point[point_index] = child_id
-        for batch_id in torch.unique(batch_ids):
-            scene_mask = batch_ids == batch_id
-            for region_id in torch.unique(regions[scene_mask]):
-                mask = scene_mask & (regions == region_id)
-                if int(region_id.item()) < 0:
-                    continue
-                indices = torch.nonzero(mask, as_tuple=False).flatten()
-                child_values = [accepted_by_point.get(int(index.item()), -1) for index in indices]
-                if child_values and child_values[0] >= 0:
-                    child_tensor = torch.tensor(child_values, device=device)
-                    dynamic_regions[indices[child_tensor == 0]] = next_region
-                    next_region += 1
-                    dynamic_regions[indices[child_tensor == 1]] = next_region
-                    next_region += 1
-                else:
-                    dynamic_regions[indices] = next_region
-                    next_region += 1
+            dynamic_regions[indices[hard_assignment == 1]] = next_region
+            next_region += 1
 
         stats = {
             "candidate_regions": candidate_count,
