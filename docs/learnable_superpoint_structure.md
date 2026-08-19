@@ -72,6 +72,40 @@ CUDA_VISIBLE_DEVICES=0 PYTHONNOUSERSITE=1 conda run -n cm_growsp \
 The structure-only ablation removes `--refine_enable`. The GrowSP baseline
 removes both flags.
 
+The default structure configuration is deliberately conservative: at most
+four candidate parents are considered per scene, verified child supervision is
+disabled, and structural gradients update only the assignment module. The
+learned partition affects the backbone indirectly through the superpoint
+aggregation and pseudo-labels generated at the next clustering round.
+
+## Area-5 Controlled Experiment
+
+All runs below resume from `baseline/ckpts/model_1250_resume.pth`, train for 20
+epochs, evaluate at epochs 1260 and 1270, and use the same S3DIS Area-5 split.
+The baseline was rerun in the current environment rather than copied from an
+older log because progressive KMeans introduces measurable run variation.
+
+| Configuration | Epoch 1260 mIoU | Epoch 1270 mIoU | Delta vs. rerun baseline at 1270 |
+| --- | ---: | ---: | ---: |
+| GrowSP rerun baseline | 44.58 | 42.14 | - |
+| Aggressive split plus direct supervision | 40.71 | stopped | - |
+| Conservative split plus direct supervision | 41.86 | stopped | - |
+| Conservative structure-only feedback | 43.39 | **44.39** | **+2.25** |
+
+The effective run accepted 367 splits across 204 training scenes at the epoch
+1261 reclustering boundary and changed 0.61% of training points. Independent
+evaluation of the saved epoch-1270 checkpoints reproduced 44.39 mIoU, 56.74
+mAcc, and 80.95 oAcc for structure-only feedback versus 42.14 mIoU, 54.15
+mAcc, and 78.72 oAcc for the rerun baseline.
+
+The comparison also exposes an important optimization constraint. Letting the
+structure or child-consensus loss directly update the backbone conflicts with
+GrowSP's primitive-clustering objective and degrades accuracy. The validated
+variant therefore learns the partition on detached backbone features and
+feeds accepted structure changes back through the next unsupervised
+aggregation and pseudo-label cycle. This is a single controlled run; final
+paper numbers should report repeated seeds.
+
 ## Verification Snapshot
 
 The real-scene smoke test on `Area_1_WC_1` with the epoch-350 reference model
@@ -80,6 +114,5 @@ coverage, 30,465 trainable parameters, and about 356 MB peak allocated GPU
 memory for the complete diagnostic process. The clustering-path check produced
 48,199 valid points and exactly 48,199 point-region indices.
 
-These values verify implementation behavior and interface compatibility; they
-are not segmentation accuracy results. Full Area-5 training and ablation are
-still required to report mIoU improvement.
+These values verify implementation behavior and interface compatibility. The
+Area-5 experiment above reports segmentation accuracy separately.

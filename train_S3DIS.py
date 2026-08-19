@@ -116,15 +116,15 @@ def parse_args():
     parser.add_argument('--learnable_sp_query_scale', type=float, default=10.0,
                         help='logit scale used only to discover and verify dynamic regions')
     parser.add_argument('--learnable_sp_structure_lambda', type=float, default=0.1, help='structural objective weight')
-    parser.add_argument('--learnable_sp_supervision_lambda', type=float, default=0.2, help='verified region supervision weight')
+    parser.add_argument('--learnable_sp_supervision_lambda', type=float, default=0.0, help='verified region supervision weight')
     parser.add_argument('--learnable_sp_min_region_points', type=int, default=20, help='minimum candidate parent size')
     parser.add_argument('--learnable_sp_min_child_points', type=int, default=6, help='minimum verified child size')
-    parser.add_argument('--learnable_sp_max_regions', type=int, default=12, help='maximum candidate parents per scene')
-    parser.add_argument('--learnable_sp_purity_th', type=float, default=0.9, help='candidate semantic purity threshold')
-    parser.add_argument('--learnable_sp_entropy_th', type=float, default=0.3, help='candidate normalized entropy threshold')
-    parser.add_argument('--learnable_sp_child_conf_th', type=float, default=0.2, help='minimum child consensus confidence')
-    parser.add_argument('--learnable_sp_conf_gain', type=float, default=0.01, help='minimum child confidence gain')
-    parser.add_argument('--learnable_sp_semantic_sep', type=float, default=0.15, help='minimum child semantic separation')
+    parser.add_argument('--learnable_sp_max_regions', type=int, default=4, help='maximum candidate parents per scene')
+    parser.add_argument('--learnable_sp_purity_th', type=float, default=0.8, help='candidate semantic purity threshold')
+    parser.add_argument('--learnable_sp_entropy_th', type=float, default=0.4, help='candidate normalized entropy threshold')
+    parser.add_argument('--learnable_sp_child_conf_th', type=float, default=0.5, help='minimum child consensus confidence')
+    parser.add_argument('--learnable_sp_conf_gain', type=float, default=0.05, help='minimum child confidence gain')
+    parser.add_argument('--learnable_sp_semantic_sep', type=float, default=0.5, help='minimum child semantic separation')
     return parser.parse_args()
 
 
