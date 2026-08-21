@@ -18,16 +18,22 @@ The evaluator now checks the SHA-256 binding between every dataset-specific
 Refiner and its frozen backbone. A mismatched checkpoint terminates evaluation.
 There is no zero-residual Refiner fallback in these results.
 
+The ScanNet result reported in the previous revision is withdrawn. Native
+`eval_ScanNet.py` reproduces only 3.54 mIoU from the supplied local epoch-930
+checkpoint, while the GrowSP paper reports 25.4 +/- 2.3. The local training log
+also records only 3.58--4.56 mIoU at epochs 30--100 and stops at epoch 108.
+This is an invalid or incomplete local run, not an official GrowSP baseline.
+
 ## Checkpoint Protocol
 
 | Experiment | Frozen checkpoint | References | Refiner checkpoint |
 | --- | --- | --- | --- |
 | S3DIS / GrowSP | `S3DIS/baseline/ckpts`, 1270 | 1170/1180/1190 | `S3DIS/refiner_projectloss02_e10/refiner_best_checkpoint.pth` |
-| ScanNet / GrowSP | `ScanNet/baseline`, 930 | 900/910/920 | `ScanNet/four_stage_refiner/refiner_final_checkpoint.pth` |
+| ScanNet / GrowSP | invalid local run; withdrawn | - | - |
 | SemanticKITTI / GrowSP | `SemanticKITTI/baseline/ckpts`, 400 | 370/380/390 | `SemanticKITTI/four_stage_refiner/refiner_final_checkpoint.pth` |
-| S3DIS / LogoSP | LogoSP `S3DIS/seg`, 100 | 70/80/90 | `LogoSP/S3DIS/four_stage_refiner/refiner_final_checkpoint.pth` |
+| S3DIS / LogoSP | LogoSP `S3DIS/seg`, 20 | 10 | `LogoSP/S3DIS/four_stage_refiner_e20/refiner_final_checkpoint.pth` |
 
-ScanNet, SemanticKITTI, and LogoSP Refiners are trained separately with frozen
+SemanticKITTI and LogoSP Refiners are trained separately with frozen
 features, current predictions, historical-checkpoint consistency, and
 superpoint structure. Their optimizers do not read ground-truth labels.
 Verifier and episodic Meta decisions are also label-free. Ground truth is read
@@ -41,23 +47,25 @@ learned component: backbone, classifier, historical references, and Refiner.
 
 ## Quantitative Results
 
-| Dataset / backbone | Scope | Frozen | Split | Refiner | Fixed Meta | Online Meta / Verifier |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| S3DIS / GrowSP | Area 5, 68 scenes | 43.8588 | 44.6369 | 45.1113 | **45.8402** | **45.8381** |
-| ScanNet / GrowSP | validation, 312 scenes | 3.5364 | 3.5772 | **3.9223** | 3.6759 | **3.7234** |
-| SemanticKITTI / GrowSP | sequence 08, stride 40, 102 frames | **14.1501** | 13.7745 | 10.5878 | 12.5907 | **14.1501** (rollback) |
-| S3DIS / LogoSP | Area 5, 68 scenes | 43.7671 | 43.7526 | 43.8860 | **44.2860** | **44.2821** |
+| Dataset / backbone | Scope | Frozen | Split | Refiner | Fixed Meta | Online Meta | Selected final |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| S3DIS / GrowSP | Area 5, 68 scenes | 43.8588 | 44.6369 | 45.1113 | **45.8402** | 45.8381 | **45.8381** |
+| ScanNet / GrowSP | validation | invalid local checkpoint | - | - | - | - | withdrawn |
+| SemanticKITTI / GrowSP | sequence 08, stride 40, 102 frames | **14.1501** | 13.7745 | 10.5878 | 12.5907 | 12.5709 | **14.1501** (rollback) |
+| S3DIS / LogoSP | Area 5, 68 scenes | 45.9827 | **46.7690** | 45.7854 | 46.3705 | 45.7854 | **45.9827** (rollback) |
 
 The exact S3DIS 45.84 result is reproduced. Relative to the frozen checkpoint,
 split contributes +0.7782 mIoU, the trained Refiner reaches +1.2526, and fixed
 Meta/Verifier reaches +1.9814. Online episodic adaptation reaches 45.8381 and
 is effectively tied with the fixed 45.8402 configuration.
 
-LogoSP obtains +0.5150 mIoU with its own Refiner, supporting backbone
-portability. ScanNet obtains +0.1869 with the complete selected path, although
-its separately trained Refiner alone is stronger at +0.3859; this indicates
-that S3DIS Meta calibration is too conservative for the supplied low-quality
-ScanNet checkpoint.
+LogoSP's native evaluator shows that epoch 20 is the best supplied local
+checkpoint at 45.98 mIoU; epoch 100 has regressed to 43.77. With a newly trained
+epoch-20-specific Refiner, decomposition reaches 46.7690 (+0.7864), but the raw
+Refiner and online Meta paths regress. Because the only historical reference
+does not pass the temporal-anchor test, automatic selection rolls back to the
+45.9827 frozen prediction. Thus the decomposition module transfers positively,
+whereas full Refiner/Meta portability is not established by this run.
 
 SemanticKITTI is a negative transfer result. Its Refiner and temporal anchors
 are unreliable under the indoor-scene thresholds. Because none of the
@@ -71,14 +79,16 @@ Refiner output as the final method.
 | Dataset / backbone | Scenes | Seconds / scene | Peak allocated memory |
 | --- | ---: | ---: | ---: |
 | S3DIS / GrowSP | 68 | 1.75 | 1848 MB |
-| ScanNet / GrowSP | 312 | 0.67 | 805 MB |
 | SemanticKITTI / GrowSP | 102 | 12.70 | 620 MB |
-| S3DIS / LogoSP | 68 | 2.42 | 2649 MB |
 
-Timing includes the frozen backbone, three historical references, superpoint
-decomposition, Refiner, episodic adaptation, and verification. S3DIS and
-ScanNet Refiners have 286,756 and 289,852 parameters respectively;
-SemanticKITTI has 289,465, while the 384-dimensional LogoSP Refiner has 418,852.
+ScanNet efficiency is withdrawn with its invalid checkpoint. The corrected
+LogoSP run shared GPU 1 with another process and is therefore excluded from
+the efficiency comparison; it must be profiled again on an uncontended GPU.
+
+Timing includes the frozen backbone, historical references, superpoint
+decomposition, Refiner, episodic adaptation, and verification. The S3DIS
+Refiner has 286,756 parameters, SemanticKITTI has 289,465, and the
+384-dimensional LogoSP Refiner has 418,852.
 The verifier has no trainable parameters.
 
 ## Qualitative Results

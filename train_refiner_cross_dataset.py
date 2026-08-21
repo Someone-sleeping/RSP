@@ -17,6 +17,7 @@ from datasets.SemanticKITTI import KITTItrain, cfl_collate_fn as kitti_collate
 from lib.split_regions import build_region_consistency_queries, build_split_region_queries
 from models.query_refiner import ErrorQueryRefiner, delta_l2, refinement_keep_kl
 from tools_eval_error_verifier import (
+    KNOWN_INVALID_BASE_CHECKPOINTS,
     load_reference,
     model_input,
     project_region_and_split,
@@ -56,8 +57,8 @@ PRESETS = {
     },
     "logosp_s3dis": {
         "checkpoint_dir": "/home/magic/magic/cm/repositories/LogoSP/ckpt/S3DIS/seg",
-        "base_epoch": 100,
-        "reference_epochs": "70,80,90",
+        "base_epoch": 20,
+        "reference_epochs": "10",
         "data_path": "/home/magic/magic/cm/repositories/LogoSP/data/S3DIS/input_0.010",
         "sp_path": "/home/magic/magic/cm/repositories/LogoSP/data/S3DIS/initial_superpoints/",
         "input_dim": 3,
@@ -98,6 +99,7 @@ def parse_args():
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--num_heads", type=int, default=4)
     parser.add_argument("--seed", type=int, default=2022)
+    parser.add_argument("--allow_invalid_checkpoint", action="store_true", default=False)
     return parser.parse_args()
 
 
@@ -221,6 +223,16 @@ def main():
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
+    base_model_path = os.path.join(
+        args.checkpoint_dir, f"model_{args.base_epoch}_checkpoint.pth"
+    )
+    base_model_hash = checkpoint_sha256(base_model_path)
+    if (
+        base_model_hash in KNOWN_INVALID_BASE_CHECKPOINTS
+        and not args.allow_invalid_checkpoint
+    ):
+        raise ValueError(KNOWN_INVALID_BASE_CHECKPOINTS[base_model_hash])
+
     base_model, base_centers = load_reference(args, args.base_epoch)
     for parameter in base_model.parameters():
         parameter.requires_grad_(False)
@@ -336,6 +348,7 @@ def main():
         "base_model_sha256": checkpoint_sha256(model_path),
         "base_classifier_sha256": checkpoint_sha256(classifier_path),
         "refiner_checkpoint": refiner_path,
+        "refiner_sha256": checkpoint_sha256(refiner_path),
         "history": history,
         "label_usage": "No ground-truth labels are used by the Refiner optimizer.",
     }

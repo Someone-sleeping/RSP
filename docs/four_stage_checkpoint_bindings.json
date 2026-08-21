@@ -9,6 +9,8 @@
     "refiner_sha256": "7d9ed6ba0145a1394c3ee1c9efee397e5028e7a55e5d25269649fc4864211831"
   },
   "scannet": {
+    "status": "invalid_local_checkpoint_do_not_report",
+    "official_reported_miou": "25.4 +/- 2.3",
     "base_epoch": 930,
     "reference_epochs": [900, 910, 920],
     "checkpoint_dir": "ckpt/ScanNet/baseline",
@@ -27,12 +29,12 @@
     "refiner_sha256": "22b98eb7b55b6b134ecf1e767e27e0bebbbfec02d09956b7e807bbf7456c52f1"
   },
   "logosp_s3dis": {
-    "base_epoch": 100,
-    "reference_epochs": [70, 80, 90],
+    "base_epoch": 20,
+    "reference_epochs": [10],
     "checkpoint_dir": "/home/magic/magic/cm/repositories/LogoSP/ckpt/S3DIS/seg",
-    "base_model_sha256": "b9942b56d6b942c38bf9a28fd1f738e0dd16efbfde49ec670227f3fa93c1de7e",
-    "base_classifier_sha256": "f2f6807abe4740d7e4861d68d30792963545598b98a436db630a4aa9fccfc873",
-    "refiner_checkpoint": "ckpt/LogoSP/S3DIS/four_stage_refiner/refiner_final_checkpoint.pth",
-    "refiner_sha256": "81c353b2c0ff70df8ad1458ef0001a44cac870650f4f5f2a020d82c15faa7c32"
+    "base_model_sha256": "5a50110b46db218eda285dc1479ad5a93cd391c9bb8df6e9be60fdbd591b359f",
+    "base_classifier_sha256": "c07cde34fbf8fe1766dd3a1e1345063550d78a000b04cff5351584d429a5ea97",
+    "refiner_checkpoint": "ckpt/LogoSP/S3DIS/four_stage_refiner_e20/refiner_final_checkpoint.pth",
+    "refiner_sha256": "e213fe23498a1ffdcf0ce90416054846e96e097f4e1231f60930bd613ae68bbe"
   }
 }

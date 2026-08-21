@@ -33,6 +33,14 @@ from models.fpn import Res16FPN18
 from models.query_refiner import ErrorQueryRefiner
 
 
+KNOWN_INVALID_BASE_CHECKPOINTS = {
+    "f910f3295f6773965ca5d671791368f551137a9380e0ad895bf8c72c2fb0351a": (
+        "The supplied ScanNet epoch-930 run reproduces 3.54 mIoU instead of "
+        "the reported 25.4 +/- 2.3 and must not be used as a formal baseline."
+    ),
+}
+
+
 def parse_args():
     parser = argparse.ArgumentParser("Evaluate label-free temporal/region correction verification")
     parser.add_argument(
@@ -98,6 +106,7 @@ def parse_args():
     parser.add_argument("--scene_stride", type=int, default=1)
     parser.add_argument("--max_scenes", type=int, default=0)
     parser.add_argument("--scene_output_dir", default="")
+    parser.add_argument("--allow_invalid_checkpoint", action="store_true", default=False)
     parser.add_argument("--output_json", default="")
     return parser.parse_args()
 
@@ -173,6 +182,12 @@ def verify_refiner_binding(args):
     actual_hashes = {}
     for component, checkpoint_path, metadata_key in checkpoint_specs:
         actual_hash = checkpoint_sha256(checkpoint_path)
+        if (
+            component == "backbone"
+            and actual_hash in KNOWN_INVALID_BASE_CHECKPOINTS
+            and not getattr(args, "allow_invalid_checkpoint", False)
+        ):
+            raise ValueError(KNOWN_INVALID_BASE_CHECKPOINTS[actual_hash])
         expected_hash = metadata.get(metadata_key)
         if actual_hash != expected_hash:
             raise ValueError(
