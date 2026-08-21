@@ -50,7 +50,7 @@ def test_result_verifier_accept_keep_rollback_and_temporal_override():
         delta_scores=torch.zeros(5, 3),
         delta_components={},
         query_indices=torch.empty(0, dtype=torch.long),
-        refine_mask=torch.zeros(5, dtype=torch.bool),
+        refine_mask=torch.tensor([False, False, True, False, False]),
         keep_mask=torch.ones(5, dtype=torch.bool),
         split_targets=torch.full((5,), -1, dtype=torch.long),
         statistics={},
@@ -82,3 +82,49 @@ def test_result_verifier_accept_keep_rollback_and_temporal_override():
     assert output.meta_verified_prediction.tolist() == [1, 1, 1, 1, 2]
     assert output.final_prediction.tolist() == [1, 1, 2, 1, 2]
     assert output.decision.tolist() == [1, 2, 3, 0, 0]
+
+
+def test_result_verifier_rolls_back_unsupported_refiner_change():
+    config = SemanticDifferencePipelineConfig(
+        semantic_classes=3,
+        min_temporal_votes=2,
+        meta_verify_confidence=0.60,
+        result_verify_confidence=0.90,
+    )
+    base_prediction = torch.tensor([0, 0])
+    no_op_prediction = torch.tensor([1, 1])
+    refined_prediction = torch.tensor([2, 1])
+    temporal_probability = torch.tensor(
+        [[0.80, 0.15, 0.05], [0.05, 0.90, 0.05]]
+    )
+    temporal_votes = torch.tensor([[3, 0, 0], [0, 3, 0]])
+    decomposition = DecompositionOutput(
+        no_op_scores=_scores(no_op_prediction.tolist()),
+        refined_scores=_scores(refined_prediction.tolist()),
+        delta_scores=torch.zeros(2, 3),
+        delta_components={},
+        query_indices=torch.empty(0, dtype=torch.long),
+        refine_mask=torch.ones(2, dtype=torch.bool),
+        keep_mask=torch.zeros(2, dtype=torch.bool),
+        split_targets=torch.full((2,), -1, dtype=torch.long),
+        statistics={},
+    )
+    meta_refiner = MetaRefinerOutput(
+        probability=torch.softmax(_scores(refined_prediction.tolist()), dim=1),
+        scene_accepted=False,
+        statistics={},
+    )
+
+    output = verify_result(
+        config,
+        base_prediction,
+        no_op_prediction,
+        temporal_probability,
+        temporal_votes,
+        decomposition,
+        meta_refiner,
+    )
+
+    assert output.rollback_mask.tolist() == [True, False]
+    assert output.meta_verified_prediction.tolist() == [1, 1]
+    assert output.final_prediction.tolist() == [1, 1]

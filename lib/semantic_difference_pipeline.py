@@ -36,6 +36,7 @@ class SemanticDifferencePipelineConfig:
     meta_verify_confidence: float = 0.64
     result_verify_confidence: float = 0.80
     min_temporal_votes: int = 2
+    enable_temporal_override: bool = True
 
 
 @dataclass
@@ -293,34 +294,34 @@ def verify_result(
     decomposition,
     meta_refiner,
 ):
-    refined_prediction = decomposition.refined_prediction
     no_op_prediction = decomposition.no_op_prediction
     meta_prediction = meta_refiner.prediction
     temporal_confidence, temporal_prediction = temporal_mean_probability.max(dim=1)
 
-    meta_support = temporal_vote_count.gather(
+    candidate_support = temporal_vote_count.gather(
         1,
         meta_prediction[:, None],
     ).squeeze(1)
-    meta_confidence = temporal_mean_probability.gather(
+    candidate_confidence = temporal_mean_probability.gather(
         1,
         meta_prediction[:, None],
     ).squeeze(1)
-    meta_changed = meta_prediction != refined_prediction
+    candidate_changed = meta_prediction != no_op_prediction
     structural_support = (
         (meta_prediction == temporal_prediction)
         | (meta_prediction == region_prediction)
-        | (meta_prediction == no_op_prediction)
     )
     meta_accept_mask = (
-        meta_changed
-        & (meta_support >= int(config.min_temporal_votes))
-        & (meta_confidence >= float(config.meta_verify_confidence))
+        candidate_changed
+        & (candidate_support >= int(config.min_temporal_votes))
+        & (candidate_confidence >= float(config.meta_verify_confidence))
         & structural_support
     )
-    rollback_mask = meta_changed & ~meta_accept_mask
+    # Decomposition is the verified structural anchor. Validate the complete
+    # Refiner/Meta residual against it so a stale Refiner cannot bypass rollback.
+    rollback_mask = candidate_changed & ~meta_accept_mask
     meta_verified_prediction = meta_prediction.clone()
-    meta_verified_prediction[rollback_mask] = refined_prediction[rollback_mask]
+    meta_verified_prediction[rollback_mask] = no_op_prediction[rollback_mask]
 
     temporal_support = temporal_vote_count.gather(
         1,
@@ -330,7 +331,14 @@ def verify_result(
         (temporal_support >= int(config.min_temporal_votes))
         & (temporal_confidence >= float(config.result_verify_confidence))
         & (temporal_prediction != base_prediction)
+        & (
+            (temporal_prediction == region_prediction)
+            | (temporal_prediction == no_op_prediction)
+            | decomposition.refine_mask
+        )
     )
+    if not config.enable_temporal_override:
+        temporal_accept = torch.zeros_like(temporal_accept)
     temporal_override_mask = temporal_accept & (
         temporal_prediction != meta_verified_prediction
     )
@@ -345,7 +353,7 @@ def verify_result(
     point_count = max(int(base_prediction.numel()), 1)
     statistics = {
         "points": point_count,
-        "meta_changed": int(meta_changed.sum().item()),
+        "meta_changed": int(candidate_changed.sum().item()),
         "meta_accepted": int(meta_accept_mask.sum().item()),
         "meta_rollback": int(rollback_mask.sum().item()),
         "temporal_override": int(temporal_override_mask.sum().item()),

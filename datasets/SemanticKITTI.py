@@ -8,6 +8,10 @@ import os
 import open3d as o3d
 from lib.aug_tools import rota_coords, scale_coords, trans_coords
 
+
+def _as_numpy(value):
+    return value.numpy() if hasattr(value, "numpy") else np.asarray(value)
+
 class cfl_collate_fn:
 
     def __call__(self, list_data):
@@ -116,7 +120,7 @@ class KITTItrain(Dataset):
         scale = 1 / self.args.voxel_size
         coords = np.floor(coords * scale)
         coords, feats, labels, unique_map, inverse_map = ME.utils.sparse_quantize(np.ascontiguousarray(coords), feats, labels=labels, ignore_label=-1, return_index=True, return_inverse=True)
-        return coords.numpy(), feats, labels, unique_map, inverse_map.numpy()
+        return _as_numpy(coords), feats, labels, unique_map, _as_numpy(inverse_map)
 
 
     def __len__(self):
@@ -252,7 +256,7 @@ class KITTIval(Dataset):
         scale = 1 / self.args.voxel_size
         coords = np.floor(coords * scale)
         coords, feats, labels, unique_map, inverse_map = ME.utils.sparse_quantize(np.ascontiguousarray(coords), feats, labels=labels, ignore_label=-1, return_index=True, return_inverse=True)
-        return coords.numpy(), feats, labels, unique_map, inverse_map.numpy()
+        return _as_numpy(coords), feats, labels, unique_map, _as_numpy(inverse_map)
 
 
     def __len__(self):

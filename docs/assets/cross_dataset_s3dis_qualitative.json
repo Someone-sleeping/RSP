@@ -1,0 +1,71 @@
+{
+  "semantic_mapping": [
+    4,
+    2,
+    10,
+    0,
+    1,
+    5,
+    3,
+    9,
+    11,
+    8,
+    6,
+    7
+  ],
+  "legend": {
+    "changed": "blue",
+    "corrected": "green",
+    "harmed": "red"
+  },
+  "selected_scenes": [
+    {
+      "scene": "Area_5_WC_2",
+      "room_type": "WC",
+      "original_points": 407457,
+      "base_point_accuracy": 0.8240195145688609,
+      "verified_point_accuracy": 0.9000471019804667,
+      "gain_percentage_points": 7.602758741160576,
+      "prediction_change_ratio": 0.12301103309304044,
+      "corrected_ratio": 0.07396117872560785,
+      "harmed_ratio": 0.01414382376545255,
+      "changed_ratio": 0.0967832188427245
+    },
+    {
+      "scene": "Area_5_hallway_1",
+      "room_type": "hallway",
+      "original_points": 2124498,
+      "base_point_accuracy": 0.6731495733145025,
+      "verified_point_accuracy": 0.7102253713300858,
+      "gain_percentage_points": 3.707579801558325,
+      "prediction_change_ratio": 0.12714150638532154,
+      "corrected_ratio": 0.06590733434439572,
+      "harmed_ratio": 0.029454958300737397,
+      "changed_ratio": 0.12500364792059113
+    },
+    {
+      "scene": "Area_5_office_4",
+      "room_type": "office",
+      "original_points": 523125,
+      "base_point_accuracy": 0.7909790161947673,
+      "verified_point_accuracy": 0.8218516961990676,
+      "gain_percentage_points": 3.0872680004300324,
+      "prediction_change_ratio": 0.07121983639082459,
+      "corrected_ratio": 0.042702986857825566,
+      "harmed_ratio": 0.012511350059737157,
+      "changed_ratio": 0.06964874551971326
+    },
+    {
+      "scene": "Area_5_storage_4",
+      "room_type": "storage",
+      "original_points": 439060,
+      "base_point_accuracy": 0.8947431671004799,
+      "verified_point_accuracy": 0.922440752404181,
+      "gain_percentage_points": 2.7697585303701144,
+      "prediction_change_ratio": 0.04550805308453486,
+      "corrected_ratio": 0.029380950211816154,
+      "harmed_ratio": 0.006283879196465176,
+      "changed_ratio": 0.037949255227076026
+    }
+  ]
+}
