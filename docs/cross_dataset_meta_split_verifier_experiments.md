@@ -1,128 +1,120 @@
-# Cross-Dataset Split + Meta-Refiner + Verify Experiments
+# Dataset-Specific Four-Stage Experiments
 
-## Scope
+## Correction
 
-This branch evaluates a common semantic-difference pipeline on GrowSP S3DIS,
-ScanNet, SemanticKITTI, and LogoSP S3DIS checkpoints. Ground truth is accessed
-only after every stage prediction has been produced and is used only for
-Hungarian matching and metrics.
+The target method is the S3DIS configuration that reaches 45.84 mIoU, not the
+later learnable-superpoint checkpoint that starts at 44.39 mIoU. The exact
+S3DIS checkpoint chain is:
 
-The experiment has two distinct scopes that must not be conflated:
+- frozen backbone and classifier: `ckpt/S3DIS/baseline/ckpts`, epoch 1270;
+- historical references: epochs 1170, 1180, and 1190 from the same run;
+- Error-Query Refiner: `ckpt/S3DIS/refiner_projectloss02_e10/refiner_best_checkpoint.pth`;
+- fixed Meta/Verifier configuration: temporal PoE weight 0.08 and confidence
+  threshold 0.80;
+- online episodic Meta: class-wise support/query adaptation followed by the
+  temporal override verifier.
 
-- S3DIS uses the training-integrated learnable-superpoint checkpoint and its
-  learned assignment module, followed by the trained Query Refiner, episodic
-  gate/bias adaptation, and full-residual verification.
-- ScanNet, SemanticKITTI, and LogoSP have no dataset-specific learned
-  superpoint or Refiner checkpoint. They therefore use the fixed
-  semantic-difference decomposition and a zero-residual conservative start;
-  only label-free episodic gate/bias adaptation is allowed. These runs test
-  checkpoint and backbone portability, not a fully retrained method.
+The evaluator now checks the SHA-256 binding between every dataset-specific
+Refiner and its frozen backbone. A mismatched checkpoint terminates evaluation.
+There is no zero-residual Refiner fallback in these results.
 
-The checkpoint-level runner is an experimental diagnostic. It does not change
-the method's paper positioning: accepted structure and semantic corrections
-are intended to alter superpoint aggregation and training supervision inside
-the unsupervised training process, rather than being described as a generic
-final-prediction post-processing method.
+## Checkpoint Protocol
 
-## Verification Correction
+| Experiment | Frozen checkpoint | References | Refiner checkpoint |
+| --- | --- | --- | --- |
+| S3DIS / GrowSP | `S3DIS/baseline/ckpts`, 1270 | 1170/1180/1190 | `S3DIS/refiner_projectloss02_e10/refiner_best_checkpoint.pth` |
+| ScanNet / GrowSP | `ScanNet/baseline`, 930 | 900/910/920 | `ScanNet/four_stage_refiner/refiner_final_checkpoint.pth` |
+| SemanticKITTI / GrowSP | `SemanticKITTI/baseline/ckpts`, 400 | 370/380/390 | `SemanticKITTI/four_stage_refiner/refiner_final_checkpoint.pth` |
+| S3DIS / LogoSP | LogoSP `S3DIS/seg`, 100 | 70/80/90 | `LogoSP/S3DIS/four_stage_refiner/refiner_final_checkpoint.pth` |
 
-The previous verifier only checked changes introduced by Meta relative to the
-Refiner. A stale Refiner could therefore damage a new backbone and bypass
-rollback. The new full-residual verifier uses accepted decomposition as the
-structural anchor and verifies every Refiner or Meta change. Unsupported
-changes return to decomposition. Cross-backbone temporal override is disabled
-because independently clustered semantic centers can otherwise produce large
-but semantically misaligned updates.
+ScanNet, SemanticKITTI, and LogoSP Refiners are trained separately with frozen
+features, current predictions, historical-checkpoint consistency, and
+superpoint structure. Their optimizers do not read ground-truth labels.
+Verifier and episodic Meta decisions are also label-free. Ground truth is read
+only after prediction for Hungarian matching, metrics, and qualitative error
+diagnosis.
+
+The episodic Meta stage in the 45.84 protocol performs scene-local support/query
+optimization and has no learned network checkpoint; the verifier is likewise
+parameter-free. “Dataset-specific checkpoint” therefore applies to every
+learned component: backbone, classifier, historical references, and Refiner.
 
 ## Quantitative Results
 
-| Dataset / backbone | Evaluation scope | Base mIoU | Decomposition | Meta before verify | Final verified | Delta |
+| Dataset / backbone | Scope | Frozen | Split | Refiner | Fixed Meta | Online Meta / Verifier |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| S3DIS / GrowSP | Area 5, 68 scenes | 44.3876 | 44.8699 | 41.9415 | **44.8905** | **+0.5029** |
-| ScanNet / GrowSP | validation, 312 scenes | 3.5364 | 3.5772 | 3.5772 | **3.5772** | **+0.0408** |
-| SemanticKITTI / GrowSP | sequence 08, uniform stride 40, 102 frames | 14.1501 | 13.7745 | 13.7745 | **13.7745** | **-0.3756** |
-| S3DIS / LogoSP | Area 5, 68 scenes | 43.7671 | 43.7526 | 43.7526 | **43.7526** | **-0.0145** |
+| S3DIS / GrowSP | Area 5, 68 scenes | 43.8588 | 44.6369 | 45.1113 | **45.8402** | **45.8381** |
+| ScanNet / GrowSP | validation, 312 scenes | 3.5364 | 3.5772 | **3.9223** | 3.6759 | **3.7234** |
+| SemanticKITTI / GrowSP | sequence 08, stride 40, 102 frames | **14.1501** | 13.7745 | 10.5878 | 12.5907 | **14.1501** (rollback) |
+| S3DIS / LogoSP | Area 5, 68 scenes | 43.7671 | 43.7526 | 43.8860 | **44.2860** | **44.2821** |
 
-S3DIS is the only run with all learned components. Its trained Refiner does not
-transfer cleanly to the learned-structure backbone by itself: Refiner mIoU is
-41.9270. Meta raises this by 0.0145, and the verifier rolls unsupported
-residuals back to reach 44.8905. The net gain over the 44.3876
-training-integrated structure checkpoint is 0.5029 mIoU.
+The exact S3DIS 45.84 result is reproduced. Relative to the frozen checkpoint,
+split contributes +0.7782 mIoU, the trained Refiner reaches +1.2526, and fixed
+Meta/Verifier reaches +1.9814. Online episodic adaptation reaches 45.8381 and
+is effectively tied with the fixed 45.8402 configuration.
 
-ScanNet is a valid negative-quality audit: the supplied epoch-930 checkpoint
-has only 3.5364 mIoU and triggers no split or Meta episodes under the fixed
-thresholds. SemanticKITTI is evaluated on 102 frames sampled uniformly from
-sequence 08 without consulting labels. It triggers 35.72 semantic-difference
-queries per frame, but no split or Meta episode is accepted; fixed region
-projection lowers mIoU by 0.3756. LogoSP remains effectively neutral without a
-LogoSP-trained Refiner. These results establish that the runner supports all
-three datasets and a second backbone, but they do not support a claim of
-cross-dataset learned-module generalization. Dataset-specific structure and
-Refiner training is required for that claim.
+LogoSP obtains +0.5150 mIoU with its own Refiner, supporting backbone
+portability. ScanNet obtains +0.1869 with the complete selected path, although
+its separately trained Refiner alone is stronger at +0.3859; this indicates
+that S3DIS Meta calibration is too conservative for the supplied low-quality
+ScanNet checkpoint.
+
+SemanticKITTI is a negative transfer result. Its Refiner and temporal anchors
+are unreliable under the indoor-scene thresholds. Because none of the
+historical checkpoints passes the label-free anchor test, the corrected
+Verifier keeps the frozen prediction instead of applying the harmful proposal.
+The result therefore remains 14.1501 rather than reporting the raw 10.5878
+Refiner output as the final method.
 
 ## Efficiency
 
-| Dataset / backbone | Scenes | Mean seconds / scene | Peak allocated memory |
+| Dataset / backbone | Scenes | Seconds / scene | Peak allocated memory |
 | --- | ---: | ---: | ---: |
-| S3DIS / GrowSP | 68 | 2.61 | 1803 MB |
-| ScanNet / GrowSP | 312 | 1.42 | 679 MB |
-| SemanticKITTI / GrowSP | 102 | 19.00 | 1062 MB |
-| S3DIS / LogoSP | 68 | 4.04 | 1871 MB |
+| S3DIS / GrowSP | 68 | 1.75 | 1848 MB |
+| ScanNet / GrowSP | 312 | 0.67 | 805 MB |
+| SemanticKITTI / GrowSP | 102 | 12.70 | 620 MB |
+| S3DIS / LogoSP | 68 | 2.42 | 2649 MB |
 
-For S3DIS, the Query Refiner has 286,756 parameters, the learnable structure
-module has 30,465, and the episodic adapter has 14. Total additional trainable
-state is 317,235 parameters; verification is parameter-free. The reported
-end-to-end time includes the current backbone, three historical references,
-decomposition, Meta adaptation, and verification.
+Timing includes the frozen backbone, three historical references, superpoint
+decomposition, Refiner, episodic adaptation, and verification. S3DIS and
+ScanNet Refiners have 286,756 and 289,852 parameters respectively;
+SemanticKITTI has 289,465, while the 384-dimensional LogoSP Refiner has 418,852.
+The verifier has no trainable parameters.
 
 ## Qualitative Results
 
-The Area-5 qualitative comparison maps all predictions and region IDs back to
-the original point cloud. Four room types are selected by point-accuracy gain:
-WC, hallway, office, and storage. Each selected scene contains full-resolution
-PLY files for:
+The corrected S3DIS visualization is generated from the same 45.84 checkpoint
+chain and mapped back to the original point clouds. It contains original RGB,
+ground truth, frozen prediction, initial superpoints, split superpoints,
+verified refinement, and a difference diagnostic. Blue denotes changed points,
+green corrected points, and red harmed points.
 
-1. original RGB point cloud;
-2. ground truth;
-3. frozen prediction;
-4. initial superpoints;
-5. split superpoints;
-6. verified refinement;
-7. difference diagnosis, where blue is changed, green is corrected, and red
-   is harmed.
+The four selected room types are WC, storage, office, and hallway. Their
+point-accuracy gains are +11.46, +6.91, +6.49, and +6.34 percentage points.
+Each panel is also exported as a full-resolution PLY.
 
-The combined figure is generated at
-`ckpt/cross_dataset/s3dis_qualitative/qualitative_comparison.png`. Full point
-clouds remain at original resolution; only the PNG renderer is deterministically
-subsampled to avoid redundant overdraw.
-
-![S3DIS qualitative comparison](assets/cross_dataset_s3dis_qualitative.png)
+![S3DIS 45.84 qualitative comparison](assets/cross_dataset_s3dis_qualitative.png)
 
 ## Reproduction
 
+The S3DIS target result is reproduced with:
+
 ```bash
-env CUDA_VISIBLE_DEVICES=1 PYTHONNOUSERSITE=1 OMP_NUM_THREADS=12 \
-  conda run -n cm_growsp python tools_eval_cross_dataset_pipeline.py \
+env CUDA_VISIBLE_DEVICES=1 conda run -n cm_growsp python tools_eval_error_verifier.py \
   --dataset s3dis \
-  --workers 4 \
-  --output_json ckpt/cross_dataset/s3dis_area5_verified.json
-
-env CUDA_VISIBLE_DEVICES=1 PYTHONNOUSERSITE=1 OMP_NUM_THREADS=12 \
-  conda run -n cm_growsp python tools_eval_cross_dataset_pipeline.py \
-  --dataset scannet \
-  --workers 4 \
-  --output_json ckpt/cross_dataset/scannet_full.json
-
-env CUDA_VISIBLE_DEVICES=1 PYTHONNOUSERSITE=1 OMP_NUM_THREADS=12 \
-  conda run -n cm_growsp python tools_eval_cross_dataset_pipeline.py \
-  --dataset semantickitti \
-  --scene_stride 40 \
-  --workers 4 \
-  --output_json ckpt/cross_dataset/semantickitti_seq08_stride40.json
-
-env CUDA_VISIBLE_DEVICES=1 PYTHONNOUSERSITE=1 OMP_NUM_THREADS=12 \
-  conda run -n cm_growsp python tools_eval_cross_dataset_pipeline.py \
-  --dataset logosp_s3dis \
-  --workers 4 \
-  --output_json ckpt/cross_dataset/logosp_s3dis_area5_full.json
+  --checkpoint_dir ckpt/S3DIS/baseline/ckpts \
+  --base_epoch 1270 \
+  --reference_epochs 1170,1180,1190 \
+  --thresholds 0.80 \
+  --selection_threshold 0.80 \
+  --refiner_checkpoint ckpt/S3DIS/refiner_projectloss02_e10/refiner_best_checkpoint.pth \
+  --meta_optimize \
+  --meta_classwise \
+  --meta_initial_weight 0.08 \
+  --meta_keep_weight 5.0 \
+  --output_json ckpt/cross_dataset/corrected_s3dis_area5_45_84_final.json
 ```
+
+Dataset-specific Refiners are trained with `train_refiner_cross_dataset.py`.
+The complete commands and resolved hashes are stored in each
+`training_metadata.json` and final experiment JSON.

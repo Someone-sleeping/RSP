@@ -17,6 +17,7 @@ older experiment branch.
 | `exp/decomposition-meta-refiner-verifier` | `16e976d` | Unified decomposition, Meta-Refiner, and verifier pipeline |
 | `exp/learnable-superpoint-structure` | `5a01ee1` | Training-integrated learnable superpoint assignment |
 | `exp/cross-dataset-meta-split-verifier` | `b8d644d` | Cross-dataset/backbone evaluation, full-residual verification, and original-point qualitative results |
+| `exp/four-stage-dataset-specific-ckpts` | `7068609` | Correct 45.84 four-stage protocol with dataset-specific Refiner checkpoints and hash binding |
 
 The learnable-structure branch starts from
 `exp/decomposition-meta-refiner-verifier`, preserving the earlier unified
@@ -25,6 +26,10 @@ pipeline as a reproducible parent version.
 The cross-dataset branch starts from the validated learnable-structure branch
 and preserves the S3DIS-only implementation before adding dataset adapters and
 the stricter cross-backbone verification protocol.
+
+The dataset-specific branch corrects the earlier cross-dataset diagnostic: it
+uses the 43.8588 S3DIS backbone associated with the 45.84 result and refuses
+silent zero-residual or mismatched-checkpoint evaluation.
 
 The two interactive-refiner commits had the same subject but different Git
 histories. The remote branch was left untouched; the local variant was pushed

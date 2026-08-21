@@ -1,6 +1,11 @@
 import argparse
+import hashlib
+import importlib
+import importlib.util
 import json
 import os
+import sys
+import time
 
 import MinkowskiEngine as ME
 import numpy as np
@@ -8,9 +13,11 @@ import torch
 import torch.nn.functional as F
 from sklearn.cluster import KMeans
 from sklearn.utils.linear_assignment_ import linear_assignment
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from datasets.S3DIS import S3DIStest, cfl_collate_fn_test
+from datasets.ScanNet import Scannetval, cfl_collate_fn_val as scannet_collate
+from datasets.SemanticKITTI import KITTIval, cfl_collate_fn_val as kitti_collate
 from eval_S3DIS import compute_unsupervised_metrics
 from lib.correction_strategies import (
     error_type_conditioned_refinement,
@@ -28,6 +35,11 @@ from models.query_refiner import ErrorQueryRefiner
 
 def parse_args():
     parser = argparse.ArgumentParser("Evaluate label-free temporal/region correction verification")
+    parser.add_argument(
+        "--dataset",
+        choices=("s3dis", "scannet", "semantickitti", "logosp_s3dis"),
+        default="s3dis",
+    )
     parser.add_argument(
         "--checkpoint_dir",
         default="/home/magic/magic/cm/repositories/GrowSP/ckpt/S3DIS/1baseline/ckpts",
@@ -83,6 +95,9 @@ def parse_args():
     parser.add_argument("--diagnostic_multi_proposal", action="store_true", default=False)
     parser.add_argument("--skip_region_oracle", action="store_true", default=False)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--scene_stride", type=int, default=1)
+    parser.add_argument("--max_scenes", type=int, default=0)
+    parser.add_argument("--scene_output_dir", default="")
     parser.add_argument("--output_json", default="")
     return parser.parse_args()
 
@@ -97,6 +112,79 @@ def parse_float_list(value):
 
 def parse_areas(value):
     return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def checkpoint_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as checkpoint_file:
+        for chunk in iter(lambda: checkpoint_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_refiner_binding(args):
+    if not args.refiner_checkpoint:
+        return {"verified": False, "reason": "No Refiner checkpoint supplied."}
+    manifest_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "docs",
+        "four_stage_checkpoint_bindings.json",
+    )
+    manifest_binding = {}
+    if os.path.exists(manifest_path):
+        with open(manifest_path, "r", encoding="utf-8") as manifest_file:
+            manifest_binding = json.load(manifest_file).get(args.dataset, {})
+    metadata_path = os.path.join(
+        os.path.dirname(args.refiner_checkpoint),
+        "training_metadata.json",
+    )
+    training_metadata = {}
+    if os.path.exists(metadata_path):
+        with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+            training_metadata = json.load(metadata_file)
+    metadata = {**manifest_binding, **training_metadata}
+    if not metadata:
+        return {
+            "verified": False,
+            "reason": f"No binding found in {metadata_path} or {manifest_path}.",
+        }
+    metadata_dataset = training_metadata.get("dataset", args.dataset)
+    if metadata_dataset != args.dataset:
+        raise ValueError(
+            f"Refiner dataset mismatch: {metadata_dataset} != {args.dataset}"
+        )
+    if int(metadata.get("base_epoch", -1)) != int(args.base_epoch):
+        raise ValueError(
+            f"Refiner base epoch mismatch: {metadata.get('base_epoch')} != {args.base_epoch}"
+        )
+    checkpoint_specs = (
+        (
+            "backbone",
+            os.path.join(args.checkpoint_dir, f"model_{args.base_epoch}_checkpoint.pth"),
+            "base_model_sha256",
+        ),
+        (
+            "classifier",
+            os.path.join(args.checkpoint_dir, f"cls_{args.base_epoch}_checkpoint.pth"),
+            "base_classifier_sha256",
+        ),
+        ("Refiner", args.refiner_checkpoint, "refiner_sha256"),
+    )
+    actual_hashes = {}
+    for component, checkpoint_path, metadata_key in checkpoint_specs:
+        actual_hash = checkpoint_sha256(checkpoint_path)
+        expected_hash = metadata.get(metadata_key)
+        if actual_hash != expected_hash:
+            raise ValueError(
+                f"{component} checkpoint mismatch: {actual_hash} != {expected_hash}"
+            )
+        actual_hashes[metadata_key] = actual_hash
+    return {
+        "verified": True,
+        "training_metadata": metadata_path if training_metadata else None,
+        "binding_manifest": manifest_path if manifest_binding else None,
+        **actual_hashes,
+    }
 
 
 def semantic_centers(primitive_classifier, semantic_class):
@@ -126,8 +214,24 @@ def align_centers(source_centers, reference_centers):
     return F.normalize(aligned, dim=1)
 
 
+def logo_model_class():
+    package_name = "four_stage_logosp_models"
+    if package_name not in sys.modules:
+        package_path = "/home/magic/magic/cm/repositories/LogoSP/models"
+        spec = importlib.util.spec_from_file_location(
+            package_name,
+            os.path.join(package_path, "__init__.py"),
+            submodule_search_locations=[package_path],
+        )
+        package = importlib.util.module_from_spec(spec)
+        sys.modules[package_name] = package
+        spec.loader.exec_module(package)
+    return importlib.import_module(f"{package_name}.fpn").Res16FPN18
+
+
 def load_reference(args, epoch, reference_centers=None):
-    model = Res16FPN18(
+    model_class = logo_model_class() if args.dataset == "logosp_s3dis" else Res16FPN18
+    model = model_class(
         in_channels=args.input_dim,
         out_channels=args.primitive_num,
         conv1_kernel_size=args.conv1_kernel_size,
@@ -145,6 +249,78 @@ def load_reference(args, epoch, reference_centers=None):
     if reference_centers is not None:
         centers = align_centers(centers, reference_centers)
     return model, centers
+
+
+def build_eval_dataset(args):
+    if args.dataset in ("s3dis", "logosp_s3dis"):
+        dataset = S3DIStest(args, areas=parse_areas(args.test_area))
+        collate = cfl_collate_fn_test()
+    elif args.dataset == "scannet":
+        dataset = Scannetval(args)
+        collate = scannet_collate()
+    else:
+        dataset = KITTIval(args)
+        collate = kitti_collate()
+    indices = list(range(0, len(dataset), max(int(args.scene_stride), 1)))
+    if args.max_scenes > 0:
+        indices = indices[: args.max_scenes]
+    return Subset(dataset, indices), collate
+
+
+def model_input(args, coords, features):
+    if args.dataset == "semantickitti":
+        return coords[:, 1:].float() * float(args.voxel_size)
+    if args.dataset == "logosp_s3dis":
+        return features[:, :3]
+    return features
+
+
+def split_colors(args, coords, features):
+    if args.dataset == "semantickitti":
+        if features.size(1) == 1:
+            return features.repeat(1, 3)
+        return coords[:, 1:].float() * float(args.voxel_size)
+    return features[:, :3]
+
+
+def save_scene_predictions(
+    args,
+    eval_dataset,
+    local_index,
+    batch,
+    scene_predictions,
+    split_targets,
+):
+    if not args.scene_output_dir:
+        return
+    source_index = eval_dataset.indices[local_index]
+    source_dataset = eval_dataset.dataset
+    if hasattr(source_dataset, "name"):
+        scene_name = str(source_dataset.name[source_index]).lstrip("/").replace("/", "_")
+    else:
+        scene_name = f"scene_{source_index:05d}"
+    coords, features, inverse_map, labels, _index, regions = batch
+    final_name = f"meta_adapt_override_t{int(round(100 * args.selection_threshold))}"
+    final_prediction = scene_predictions.get(final_name, scene_predictions["base"])
+    decision = torch.zeros_like(final_prediction)
+    decision[final_prediction != scene_predictions["base"]] = 1
+    os.makedirs(args.scene_output_dir, exist_ok=True)
+    np.savez_compressed(
+        os.path.join(args.scene_output_dir, f"{scene_name}.npz"),
+        voxel_xyz=coords[:, 1:].numpy() * float(args.voxel_size),
+        voxel_rgb=split_colors(args, coords, features).numpy(),
+        original_labels=labels.numpy(),
+        inverse_map=inverse_map.numpy(),
+        initial_regions=regions.squeeze().numpy(),
+        dynamic_regions=regions.squeeze().numpy(),
+        base=scene_predictions["base"].detach().cpu().numpy(),
+        decomposition=scene_predictions["split_noop"].detach().cpu().numpy(),
+        refiner=scene_predictions["split_refiner"].detach().cpu().numpy(),
+        meta=final_prediction.detach().cpu().numpy(),
+        final=final_prediction.detach().cpu().numpy(),
+        split_targets=split_targets.detach().cpu().numpy(),
+        decision=decision.detach().cpu().numpy(),
+    )
 
 
 def region_candidates(base_scores, regions):
@@ -219,7 +395,7 @@ def run_split_refiner(
 ):
     batch_ids = coords[:, 0].long().cuda()
     point_coords = coords[:, 1:].float().cuda()
-    point_colors = features[:, :3].float().cuda()
+    point_colors = split_colors(args, coords, features).float().cuda()
     (
         query_indices,
         refine_mask,
@@ -344,6 +520,8 @@ def oracle_diagnostic(base, labels, pred_to_gt, candidates, group_ids=None):
 
 def main():
     args = parse_args()
+    evaluation_started = time.time()
+    checkpoint_binding = verify_refiner_binding(args)
     reference_epochs = parse_int_list(args.reference_epochs)
     thresholds = parse_float_list(args.thresholds)
     blend_weights = parse_float_list(args.blend_weights)
@@ -367,10 +545,11 @@ def main():
         refiner.load_state_dict(torch.load(args.refiner_checkpoint, map_location="cpu"), strict=False)
         refiner.eval()
 
+    eval_dataset, eval_collate = build_eval_dataset(args)
     loader = DataLoader(
-        S3DIStest(args, areas=parse_areas(args.test_area)),
+        eval_dataset,
         batch_size=1,
-        collate_fn=cfl_collate_fn_test(),
+        collate_fn=eval_collate,
         num_workers=args.workers,
         pin_memory=True,
     )
@@ -481,8 +660,9 @@ def main():
     def add_proxy(name, value, weight):
         proxy_sums[name] = proxy_sums.get(name, 0.0) + float(value) * float(weight)
 
-    for coords, features, inverse_map, labels, _index, region in loader:
-        in_field = ME.TensorField(features, coords, device=0)
+    for local_scene_index, batch in enumerate(loader):
+        coords, features, inverse_map, labels, _index, region = batch
+        in_field = ME.TensorField(model_input(args, coords, features), coords, device=0)
         with torch.no_grad():
             base_feats = F.normalize(base_model(in_field), dim=1)
             base_scores = F.linear(base_feats, base_centers)
@@ -1087,6 +1267,15 @@ def main():
                         f"meta_refiner_joint_temporal_t{suffix}"
                     ] = meta_refiner_joint_temporal
 
+        if refiner is not None:
+            save_scene_predictions(
+                args,
+                eval_dataset,
+                local_scene_index,
+                batch,
+                scene_predictions,
+                split_targets,
+            )
         valid = labels != args.ignore_label
         inverse = inverse_map.long().cuda()
         for name, prediction in scene_predictions.items():
@@ -1100,6 +1289,14 @@ def main():
             full_regions[invalid_region] = start
         all_region_ids.append(full_regions)
         region_offset = int(full_regions.max().item()) + 1
+        completed = local_scene_index + 1
+        if completed % 20 == 0 or completed == len(eval_dataset):
+            elapsed = time.time() - evaluation_started
+            eta_minutes = (elapsed / completed) * (len(eval_dataset) - completed) / 60.0
+            print(
+                f"[{args.dataset}] {completed}/{len(eval_dataset)} scenes, ETA {eta_minutes:.1f} min",
+                flush=True,
+            )
 
     labels_np = torch.cat(all_labels).numpy()
     base_np = torch.cat(all_predictions["base"]).numpy()
@@ -1216,7 +1413,7 @@ def main():
     selected_threshold = min(thresholds, key=lambda value: abs(value - args.selection_threshold))
     selected_suffix = int(round(100 * selected_threshold))
     independent_candidate = f"point_region_union_t{selected_suffix}"
-    selected_independent_strategy = independent_candidate if reliable_anchor_epochs else "region"
+    selected_independent_strategy = independent_candidate if reliable_anchor_epochs else "base"
     results["selected_independent"] = dict(results[selected_independent_strategy])
     results["selected_independent"]["strategy"] = selected_independent_strategy
     if refiner is not None:
@@ -1224,7 +1421,7 @@ def main():
             joint_candidate = f"meta_adapt_override_t{selected_suffix}"
         else:
             joint_candidate = f"meta_init_poe_override_t{selected_suffix}"
-        selected_joint_strategy = joint_candidate if reliable_anchor_epochs else "split_refiner"
+        selected_joint_strategy = joint_candidate if reliable_anchor_epochs else "base"
         results["selected_joint"] = dict(results[selected_joint_strategy])
         results["selected_joint"]["strategy"] = selected_joint_strategy
     selection = {
@@ -1266,6 +1463,13 @@ def main():
         }
     else:
         meta_refiner_summary = {}
+    elapsed_seconds = time.time() - evaluation_started
+    efficiency = {
+        "scenes": len(eval_dataset),
+        "total_seconds": elapsed_seconds,
+        "seconds_per_scene": elapsed_seconds / max(len(eval_dataset), 1),
+        "peak_gpu_memory_mb": torch.cuda.max_memory_allocated() / (1024.0 ** 2),
+    }
 
     for name, result in sorted(results.items(), key=lambda item: item[1]["mIoU"], reverse=True):
         print(
@@ -1286,6 +1490,10 @@ def main():
             json.dump(
                 {
                     "config": vars(args),
+                    "dataset": args.dataset,
+                    "checkpoint_dir": args.checkpoint_dir,
+                    "refiner_checkpoint": args.refiner_checkpoint,
+                    "checkpoint_binding": checkpoint_binding,
                     "base_epoch": args.base_epoch,
                     "reference_epochs": reference_epochs,
                     "test_area": args.test_area,
@@ -1294,6 +1502,7 @@ def main():
                     "label_free_selection": selection,
                     "meta_optimizer": meta_summary,
                     "meta_refiner": meta_refiner_summary,
+                    "efficiency": efficiency,
                 },
                 output_file,
                 indent=2,

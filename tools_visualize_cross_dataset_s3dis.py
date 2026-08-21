@@ -72,6 +72,8 @@ def prediction_mapping(prediction, labels, classes=12):
 
 
 def meta_verified(cache):
+    if "final" in cache:
+        return cache["final"].copy()
     prediction = cache["meta"].copy()
     rollback = cache["decision"] == 2
     prediction[rollback] = cache["decomposition"][rollback]

@@ -1,17 +1,17 @@
 {
   "semantic_mapping": [
-    4,
-    2,
-    10,
+    7,
     0,
-    1,
-    5,
     3,
-    9,
-    11,
+    5,
     8,
-    6,
-    7
+    1,
+    2,
+    11,
+    10,
+    9,
+    4,
+    6
   ],
   "legend": {
     "changed": "blue",
@@ -23,49 +23,49 @@
       "scene": "Area_5_WC_2",
       "room_type": "WC",
       "original_points": 407457,
-      "base_point_accuracy": 0.8240195145688609,
-      "verified_point_accuracy": 0.9000471019804667,
-      "gain_percentage_points": 7.602758741160576,
-      "prediction_change_ratio": 0.12301103309304044,
-      "corrected_ratio": 0.07396117872560785,
-      "harmed_ratio": 0.01414382376545255,
-      "changed_ratio": 0.0967832188427245
+      "base_point_accuracy": 0.7803113721649131,
+      "verified_point_accuracy": 0.8948970774936755,
+      "gain_percentage_points": 11.458570532876244,
+      "prediction_change_ratio": 0.13788402930928534,
+      "corrected_ratio": 0.09337181592168008,
+      "harmed_ratio": 0.0032175174312872278,
+      "changed_ratio": 0.10848506713591864
     },
     {
-      "scene": "Area_5_hallway_1",
-      "room_type": "hallway",
-      "original_points": 2124498,
-      "base_point_accuracy": 0.6731495733145025,
-      "verified_point_accuracy": 0.7102253713300858,
-      "gain_percentage_points": 3.707579801558325,
-      "prediction_change_ratio": 0.12714150638532154,
-      "corrected_ratio": 0.06590733434439572,
-      "harmed_ratio": 0.029454958300737397,
-      "changed_ratio": 0.12500364792059113
-    },
-    {
-      "scene": "Area_5_office_4",
-      "room_type": "office",
-      "original_points": 523125,
-      "base_point_accuracy": 0.7909790161947673,
-      "verified_point_accuracy": 0.8218516961990676,
-      "gain_percentage_points": 3.0872680004300324,
-      "prediction_change_ratio": 0.07121983639082459,
-      "corrected_ratio": 0.042702986857825566,
-      "harmed_ratio": 0.012511350059737157,
-      "changed_ratio": 0.06964874551971326
-    },
-    {
-      "scene": "Area_5_storage_4",
+      "scene": "Area_5_storage_2",
       "room_type": "storage",
-      "original_points": 439060,
-      "base_point_accuracy": 0.8947431671004799,
-      "verified_point_accuracy": 0.922440752404181,
-      "gain_percentage_points": 2.7697585303701144,
-      "prediction_change_ratio": 0.04550805308453486,
-      "corrected_ratio": 0.029380950211816154,
-      "harmed_ratio": 0.006283879196465176,
-      "changed_ratio": 0.037949255227076026
+      "original_points": 499918,
+      "base_point_accuracy": 0.5536867111795574,
+      "verified_point_accuracy": 0.6228188126524935,
+      "gain_percentage_points": 6.913210147293613,
+      "prediction_change_ratio": 0.14670485485318202,
+      "corrected_ratio": 0.059027680539608496,
+      "harmed_ratio": 0.005240859500958157,
+      "changed_ratio": 0.11414071907792878
+    },
+    {
+      "scene": "Area_5_office_12",
+      "room_type": "office",
+      "original_points": 539564,
+      "base_point_accuracy": 0.7333188090050835,
+      "verified_point_accuracy": 0.7982550057059861,
+      "gain_percentage_points": 6.493619670090256,
+      "prediction_change_ratio": 0.13448283016910467,
+      "corrected_ratio": 0.07353159217442232,
+      "harmed_ratio": 0.015529205061864764,
+      "changed_ratio": 0.12012291405653454
+    },
+    {
+      "scene": "Area_5_hallway_2",
+      "room_type": "hallway",
+      "original_points": 2842505,
+      "base_point_accuracy": 0.7408231451939276,
+      "verified_point_accuracy": 0.8042040074916942,
+      "gain_percentage_points": 6.338086229776662,
+      "prediction_change_ratio": 0.11207800397172732,
+      "corrected_ratio": 0.06810366208678613,
+      "harmed_ratio": 0.008875270228196609,
+      "changed_ratio": 0.10473508401920137
     }
   ]
 }

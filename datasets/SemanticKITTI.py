@@ -168,9 +168,11 @@ class KITTItrain(Dataset):
         #
         coords_mix = self.augs(coords_mix)
         coords = np.concatenate((coords, coords_mix), axis=0)
+        feats = np.concatenate((feats, feats_mix), axis=0)
         ''' End Mixup'''
 
         coords, feats, labels = self.augment_coords_to_feats(coords, feats, labels)
+        assert coords.shape[0] == feats.shape[0]
         labels -= 1
 
         '''mode must be cluster or train'''
@@ -200,7 +202,10 @@ class KITTItrain(Dataset):
             normals = np.zeros_like(coords)
             scene_name = self.name[index]
             file_path = self.args.pseudo_label_path + '/' + scene_name + '.npy'
-            pseudo = np.array(np.load(file_path), dtype=np.long)
+            if getattr(self.args, 'allow_missing_pseudo', False) and not os.path.exists(file_path):
+                pseudo = -np.ones_like(labels, dtype=np.long)
+            else:
+                pseudo = np.array(np.load(file_path), dtype=np.long)
 
 
         return coords, feats, normals, labels, inverse_map, pseudo, inds, region, index

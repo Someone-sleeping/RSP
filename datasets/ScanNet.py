@@ -179,7 +179,10 @@ class Scannettrain(Dataset):
             normals = np.zeros_like(coords)
             scene_name = self.name[index]
             file_path = self.args.pseudo_label_path + '/' + scene_name + '.npy'
-            pseudo = np.array(np.load(file_path), dtype=np.long)
+            if getattr(self.args, 'allow_missing_pseudo', False) and not os.path.exists(file_path):
+                pseudo = -np.ones_like(labels, dtype=np.long)
+            else:
+                pseudo = np.array(np.load(file_path), dtype=np.long)
 
         return coords, feats, normals, labels, inverse_map, pseudo, inds, region, index
 
