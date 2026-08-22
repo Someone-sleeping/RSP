@@ -3,6 +3,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def gate_refiner_residual(delta_logits, candidate_mask):
+    """Restrict a learned semantic residual to its pseudo-supervised support."""
+    if delta_logits.ndim != 2:
+        raise ValueError("delta_logits must have shape [N, C]")
+    candidate_mask = candidate_mask.to(device=delta_logits.device, dtype=torch.bool).view(-1)
+    if candidate_mask.numel() != delta_logits.size(0):
+        raise ValueError("candidate_mask must contain one value per point")
+    return delta_logits * candidate_mask.unsqueeze(1).to(delta_logits.dtype)
+
+
+def resolve_min_temporal_votes(requested_votes, reference_count):
+    """Resolve automatic majority voting without weakening an explicit threshold."""
+    if reference_count < 1:
+        raise ValueError("At least one historical reference checkpoint is required")
+    if requested_votes <= 0:
+        return max(1, (reference_count + 1) // 2)
+    return int(requested_votes)
+
+
 class ErrorQueryRefiner(nn.Module):
     """Lightweight query-to-scene refinement head for GrowSP features."""
 

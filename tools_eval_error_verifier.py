@@ -30,7 +30,11 @@ from lib.meta_optimizer import meta_optimize_poe_weight
 from lib.meta_refiner import meta_adapt_refiner_gates
 from lib.split_regions import build_region_consistency_queries, build_split_region_queries
 from models.fpn import Res16FPN18
-from models.query_refiner import ErrorQueryRefiner
+from models.query_refiner import (
+    ErrorQueryRefiner,
+    gate_refiner_residual,
+    resolve_min_temporal_votes,
+)
 
 
 KNOWN_INVALID_BASE_CHECKPOINTS = {
@@ -68,7 +72,12 @@ def parse_args():
     parser.add_argument("--prob_scale", type=float, default=10.0)
     parser.add_argument("--thresholds", default="0.60,0.64")
     parser.add_argument("--selection_threshold", type=float, default=0.64)
-    parser.add_argument("--min_temporal_votes", type=int, default=2)
+    parser.add_argument(
+        "--min_temporal_votes",
+        type=int,
+        default=0,
+        help="Required checkpoint votes; zero selects a majority from available references.",
+    )
     parser.add_argument("--refiner_checkpoint", default="")
     parser.add_argument("--refiner_scale", type=float, default=1.0)
     parser.add_argument("--refiner_scales", default="0.5,0.75,1.0,1.25")
@@ -479,6 +488,15 @@ def run_split_refiner(
     else:
         delta_components = None
         delta_scores = delta_override
+    # The Refiner is trained from candidate-region supervision. Applying its
+    # residual outside that support turns a local correction into a global
+    # classifier shift, especially when pseudo targets are sparse.
+    delta_scores = gate_refiner_residual(delta_scores, refine_mask)
+    if delta_components is not None:
+        delta_components = {
+            name: gate_refiner_residual(value, refine_mask)
+            for name, value in delta_components.items()
+        }
     no_op_scores = project_region_and_split(base_scores, regions, split_targets)
     refined_scores = project_region_and_split(
         base_scores + args.refiner_scale * delta_scores,
@@ -538,6 +556,9 @@ def main():
     evaluation_started = time.time()
     checkpoint_binding = verify_refiner_binding(args)
     reference_epochs = parse_int_list(args.reference_epochs)
+    args.min_temporal_votes = resolve_min_temporal_votes(
+        args.min_temporal_votes, len(reference_epochs)
+    )
     thresholds = parse_float_list(args.thresholds)
     blend_weights = parse_float_list(args.blend_weights)
     refiner_scales = parse_float_list(args.refiner_scales)

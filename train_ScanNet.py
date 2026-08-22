@@ -151,7 +151,8 @@ def cluster(args, logger, cluster_loader, model, epoch, start_grow_epoch=None, i
     classifier = get_fixclassifier(in_channel=args.feats_dim, centroids_num=args.primitive_num, centroids=primitive_centers)
 
     '''Compute and Save Pseudo Labels'''
-    all_pseudo, all_gt, all_pseudo_gt = get_pseudo(args, context, primitive_labels, sp_index)
+    pseudo_outputs = get_pseudo(args, context, primitive_labels, sp_index)
+    all_pseudo, all_gt, all_pseudo_gt = pseudo_outputs[:3]
     logger.info('labelled points ratio %.2f clustering time: %.2fs', (all_pseudo!=-1).sum()/all_pseudo.shape[0], time.time() - time_start)
 
     '''Check Superpoint/Primitive Acc in Training'''

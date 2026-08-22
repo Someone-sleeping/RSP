@@ -1,11 +1,25 @@
 import torch
 
+from models.query_refiner import gate_refiner_residual, resolve_min_temporal_votes
 from lib.semantic_difference_pipeline import (
     DecompositionOutput,
     MetaRefinerOutput,
     SemanticDifferencePipelineConfig,
     verify_result,
 )
+
+
+def test_refiner_residual_is_zero_outside_candidate_support():
+    residual = torch.tensor([[1.0, -1.0], [2.0, -2.0], [3.0, -3.0]])
+    gated = gate_refiner_residual(residual, torch.tensor([False, True, False]))
+
+    assert gated.tolist() == [[0.0, -0.0], [2.0, -2.0], [0.0, -0.0]]
+
+
+def test_temporal_vote_resolution_preserves_conservative_explicit_threshold():
+    assert resolve_min_temporal_votes(0, 1) == 1
+    assert resolve_min_temporal_votes(0, 3) == 2
+    assert resolve_min_temporal_votes(2, 1) == 2
 
 
 def _scores(prediction, classes=3):

@@ -15,7 +15,13 @@ from datasets.S3DIS import S3DIStrain, cfl_collate_fn as s3dis_collate
 from datasets.ScanNet import Scannettrain, cfl_collate_fn as scannet_collate
 from datasets.SemanticKITTI import KITTItrain, cfl_collate_fn as kitti_collate
 from lib.split_regions import build_region_consistency_queries, build_split_region_queries
-from models.query_refiner import ErrorQueryRefiner, delta_l2, refinement_keep_kl
+from models.query_refiner import (
+    ErrorQueryRefiner,
+    delta_l2,
+    gate_refiner_residual,
+    refinement_keep_kl,
+    resolve_min_temporal_votes,
+)
 from tools_eval_error_verifier import (
     KNOWN_INVALID_BASE_CHECKPOINTS,
     load_reference,
@@ -99,6 +105,13 @@ def parse_args():
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--num_heads", type=int, default=4)
     parser.add_argument("--seed", type=int, default=2022)
+    parser.add_argument(
+        "--min_temporal_votes",
+        type=int,
+        default=2,
+        help="Required historical checkpoint votes; zero selects a majority dynamically.",
+    )
+    parser.add_argument("--temporal_confidence_threshold", type=float, default=0.80)
     parser.add_argument("--allow_invalid_checkpoint", action="store_true", default=False)
     return parser.parse_args()
 
@@ -199,10 +212,12 @@ def build_targets(args, base_scores, base_features, coords, features, regions, b
     target[split_valid] = split_targets[split_valid]
     target_confidence[split_valid] = split_conf[split_valid]
     temporal_confidence, temporal_target = temporal_probability.max(dim=1)
+    reference_count = len(parse_epochs(args.reference_epochs))
+    required_votes = resolve_min_temporal_votes(args.min_temporal_votes, reference_count)
     temporal_valid = (
         (target < 0)
-        & (temporal_votes >= 2)
-        & (temporal_confidence >= 0.80)
+        & (temporal_votes >= required_votes)
+        & (temporal_confidence >= args.temporal_confidence_threshold)
         & (temporal_target != base_scores.argmax(dim=1))
     )
     target[temporal_valid] = temporal_target[temporal_valid]
@@ -293,7 +308,7 @@ def main():
                 temporal_probability,
                 temporal_votes,
             )
-            query_indices, _refine_mask, split_targets, target, target_confidence, optimize_mask, keep_mask = targets
+            query_indices, refine_mask, split_targets, target, target_confidence, optimize_mask, keep_mask = targets
             if query_indices.numel() == 0 or not optimize_mask.any():
                 continue
             delta = refiner(
@@ -304,6 +319,7 @@ def main():
                 regions,
                 use_region_branch=False,
             )
+            delta = gate_refiner_residual(delta, refine_mask)
             refined_scores = base_scores + delta
             projected_scores = project_region_and_split(refined_scores, regions, split_targets)
             weights = target_confidence[optimize_mask].clamp_min(0.05)
@@ -350,6 +366,13 @@ def main():
         "refiner_checkpoint": refiner_path,
         "refiner_sha256": checkpoint_sha256(refiner_path),
         "history": history,
+        "target_configuration": {
+            "min_temporal_votes": args.min_temporal_votes,
+            "effective_min_temporal_votes": resolve_min_temporal_votes(
+                args.min_temporal_votes, len(parse_epochs(args.reference_epochs))
+            ),
+            "temporal_confidence_threshold": args.temporal_confidence_threshold,
+        },
         "label_usage": "No ground-truth labels are used by the Refiner optimizer.",
     }
     with open(os.path.join(args.save_path, "training_metadata.json"), "w", encoding="utf-8") as output_file:
