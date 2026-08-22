@@ -52,7 +52,7 @@ learned component: backbone, classifier, historical references, and Refiner.
 | S3DIS / GrowSP | Area 5, 68 scenes | 43.8588 | 44.6369 | 45.1113 | **45.8402** | 45.8381 | **45.8381** |
 | ScanNet / GrowSP | validation | invalid local checkpoint | - | - | - | - | withdrawn |
 | SemanticKITTI / GrowSP | sequence 08, stride 40, 102 frames | **14.1501** | 13.7745 | 10.5878 | 12.5907 | 12.5709 | **14.1501** (rollback) |
-| S3DIS / LogoSP | Area 5, 68 scenes | 45.9827 | 46.7690 | 46.3475 | 46.7272 | 46.6315 | **46.7749** (verified) |
+| S3DIS / LogoSP | Area 5, 68 scenes | 45.9827 | 46.7690 | 46.3475 | 46.7272 | 46.6315 | **45.9827** (anchor rollback) |
 
 The exact S3DIS 45.84 result is reproduced. Relative to the frozen checkpoint,
 split contributes +0.7782 mIoU, the trained Refiner reaches +1.2526, and fixed
@@ -69,7 +69,10 @@ points changes the same checkpoint from 45.7854 (-0.1973) to 46.3475
 (+0.7922). A separate one-reference temporal-target retraining run is weaker
 (45.9566 raw, 46.7430 verified), confirming that one historical checkpoint is
 not a sufficiently reliable training consensus. The original Refiner weights
-with candidate-support gating are retained.
+with candidate-support gating are retained. The generic cross-dataset anchor
+selector still rolls back to the frozen result because epoch 10 fails its
+reliability test; 46.7749 is therefore reported as the Verifier ablation rather
+than relabeled as the automatically selected final output.
 
 SemanticKITTI is a negative transfer result. Its Refiner and temporal anchors
 are unreliable under the indoor-scene thresholds. Because none of the

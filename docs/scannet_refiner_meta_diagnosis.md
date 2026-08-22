@@ -45,6 +45,10 @@ Refiner checkpoint on all 68 Area 5 scenes:
 | Online episodic Meta | 46.6315 | +0.6489 |
 | Residual verifier | **46.7749** | **+0.7922** |
 
+This is the explicit Verifier output. The generic cross-dataset anchor selector
+still keeps the frozen prediction because the sole historical checkpoint fails
+its label-free reliability test; the distinction is preserved in reporting.
+
 LogoSP supplies only one earlier checkpoint (epoch 10), and it is weaker and
 less confident than epoch 20. A two-epoch experiment that explicitly allowed
 that single checkpoint to create temporal training targets reached 45.9566 raw
