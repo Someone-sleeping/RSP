@@ -11,8 +11,12 @@ from .my_utils import VisualizationThreadPool
 
 def get_sp_feature(
     args, loader, model, current_growsp, vis=False,
-    learnable_sp=None, semantic_centers=None,
+    learnable_sp=None, semantic_centers=None, superpoint_module=None,
 ):
+    # ``learnable_sp`` is retained for old experiment commands. New code passes
+    # the deterministic Stage-3 decomposer through the neutral module name.
+    legacy_learnable_module = superpoint_module is None and learnable_sp is not None
+    superpoint_module = superpoint_module or learnable_sp
     print('computing point feats ....')
     point_feats_list = []
     point_labels_list = []
@@ -28,8 +32,8 @@ def get_sp_feature(
         'supervised_points': 0,
         'valid_points': 0,
     }
-    if learnable_sp is not None:
-        learnable_sp.eval()
+    if superpoint_module is not None:
+        superpoint_module.eval()
     with torch.no_grad():
         for batch_idx, data in enumerate(loader):
             coords, features, normals, labels, inverse_map, pseudo_labels, inds, region, index = data
@@ -57,13 +61,15 @@ def get_sp_feature(
             ##
             pc_rgb = features[:, 0:3]
             pc_xyz = features[:, 3:] * args.voxel_size
-            if learnable_sp is not None and semantic_centers is not None:
+            if superpoint_module is not None and semantic_centers is not None:
                 semantic_logits = F.linear(F.normalize(feats, dim=1), semantic_centers)
-                structure_output = learnable_sp(
+                if legacy_learnable_module:
+                    semantic_logits = semantic_logits * getattr(args, 'learnable_sp_query_scale', 10.0)
+                structure_output = superpoint_module(
                     feats,
                     pc_xyz,
                     pc_rgb,
-                    semantic_logits * getattr(args, 'learnable_sp_query_scale', 10.0),
+                    semantic_logits,
                     region,
                     torch.zeros(region.size(0), dtype=torch.long, device=feats.device),
                     min_region_points=getattr(args, 'learnable_sp_min_region_points', 20),
@@ -189,6 +195,8 @@ def get_sp_feature(
 
             torch.cuda.empty_cache()
             torch.cuda.synchronize(torch.device("cuda"))
+    args.cluster_superpoint_stats = structure_stats
+    # Compatibility for existing logging and external scripts.
     args.cluster_learnable_sp_stats = structure_stats
     return point_feats_list, point_labels_list, all_sp_index, context
 

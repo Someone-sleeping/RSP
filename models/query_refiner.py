@@ -22,8 +22,13 @@ def resolve_min_temporal_votes(requested_votes, reference_count):
     return int(requested_votes)
 
 
-class ErrorQueryRefiner(nn.Module):
-    """Lightweight query-to-scene refinement head for GrowSP features."""
+class CandidateBasedRefiner(nn.Module):
+    """Predict semantic residuals conditioned on candidate point queries.
+
+    Query tokens may read global scene context, but the returned residual can be
+    gated to candidate points. This keeps contextual reasoning global while
+    preventing an uncertain query from rewriting unrelated scene predictions.
+    """
 
     def __init__(self, feat_dim, num_classes, hidden_dim=128, num_heads=4, dropout=0.0):
         super().__init__()
@@ -86,6 +91,7 @@ class ErrorQueryRefiner(nn.Module):
         regions=None,
         use_region_branch=False,
         return_components=False,
+        candidate_mask=None,
     ):
         point_coords = point_coords.float()
         if point_coords.size(1) > 3:
@@ -107,6 +113,9 @@ class ErrorQueryRefiner(nn.Module):
                         region_delta[mask] = self.region_mlp(region_feat)
         context_delta = point_delta.new_zeros(point_delta.shape)
         if query_indices.numel() == 0:
+            if candidate_mask is not None:
+                point_delta = gate_refiner_residual(point_delta, candidate_mask)
+                region_delta = gate_refiner_residual(region_delta, candidate_mask)
             if return_components:
                 return {
                     "point": point_delta,
@@ -158,6 +167,10 @@ class ErrorQueryRefiner(nn.Module):
 
             context_delta[scene_indices] = self.out_proj(self.out_norm(scene_tokens))
 
+        if candidate_mask is not None:
+            point_delta = gate_refiner_residual(point_delta, candidate_mask)
+            context_delta = gate_refiner_residual(context_delta, candidate_mask)
+            region_delta = gate_refiner_residual(region_delta, candidate_mask)
         total_delta = point_delta + context_delta + region_delta
         if return_components:
             return {
@@ -167,6 +180,11 @@ class ErrorQueryRefiner(nn.Module):
                 "total": total_delta,
             }
         return total_delta
+
+
+# Historical checkpoints only store parameter names, so this alias keeps old
+# training and evaluation commands loadable without duplicating an implementation.
+ErrorQueryRefiner = CandidateBasedRefiner
 
 
 def refined_cross_entropy(refined_logits, pseudo_labels, trusted_mask, ignore_index=-1):

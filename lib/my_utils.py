@@ -316,7 +316,7 @@ def load_resume_checkpoint(
 
 def save_checkpoints(
     args, epoch, model, optimizer, scheduler, classifier, is_Growing, start_grow_epoch, logger,
-    refiner=None, learnable_sp=None, learnable_sp_optimizer=None,
+    refiner=None, refiner_optimizer=None, learnable_sp=None, learnable_sp_optimizer=None,
 ):
     """一键保存所有 Checkpoints，并自动兼容处理不存在的路径"""
 
@@ -331,6 +331,7 @@ def save_checkpoints(
         'epoch': epoch,
         'is_Growing': is_Growing,
         'start_grow_epoch': start_grow_epoch,
+        'training_stage': getattr(args, 'training_stage', 'growsp'),
     }
     if optimizer is not None:
         state['optimizer_state_dict'] = optimizer.state_dict()
@@ -338,6 +339,8 @@ def save_checkpoints(
         state['scheduler_state_dict'] = scheduler.state_dict()
     if refiner is not None:
         state['refiner_state_dict'] = refiner.state_dict()
+    if refiner_optimizer is not None:
+        state['refiner_optimizer_state_dict'] = refiner_optimizer.state_dict()
     if learnable_sp is not None:
         state['learnable_sp_state_dict'] = learnable_sp.state_dict()
     if learnable_sp_optimizer is not None:

@@ -10,7 +10,7 @@ import MinkowskiEngine as ME
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from models.fpn import Res16FPN18
-from models.query_refiner import ErrorQueryRefiner, refined_cross_entropy, refinement_keep_kl, delta_l2
+from models.query_refiner import CandidateBasedRefiner, refined_cross_entropy, refinement_keep_kl, delta_l2
 from models.learnable_superpoint import (
     SemanticDifferenceSuperpointLearner,
     verified_region_supervision_loss,
@@ -18,6 +18,12 @@ from models.learnable_superpoint import (
 from eval_S3DIS import eval
 from lib.utils import get_pseudo, get_sp_feature, get_fixclassifier
 from lib.error_query import build_error_queries
+from lib.stage3_pipeline import (
+    Stage3Config,
+    SuperpointDecomposer,
+    run_stage3_pipeline,
+    stage3_training_losses,
+)
 from sklearn.cluster import KMeans
 import logging
 from os.path import join
@@ -125,6 +131,20 @@ def parse_args():
     parser.add_argument('--learnable_sp_child_conf_th', type=float, default=0.5, help='minimum child consensus confidence')
     parser.add_argument('--learnable_sp_conf_gain', type=float, default=0.05, help='minimum child confidence gain')
     parser.add_argument('--learnable_sp_semantic_sep', type=float, default=0.5, help='minimum child semantic separation')
+    # Primary paper path: GrowSP Stage 1 -> GrowSP Stage 2 -> our Stage 3.
+    parser.add_argument('--stage3_enable', action='store_true', default=False,
+                        help='run split + candidate refiner + verifier after GrowSP growing')
+    parser.add_argument('--stage3_epochs', type=int, default=20, help='epochs in the third training stage')
+    parser.add_argument('--stage3_lr', type=float, default=1e-2, help='backbone learning rate in Stage 3')
+    parser.add_argument('--stage3_refiner_lr', type=float, default=1e-4, help='Candidate-based Refiner learning rate')
+    parser.add_argument('--stage3_structure_lambda', type=float, default=0.3,
+                        help='weight for verified split supervision on the backbone')
+    parser.add_argument('--stage3_refiner_lambda', type=float, default=0.3,
+                        help='weight for Candidate-based Refiner training')
+    parser.add_argument('--stage3_residual_scale', type=float, default=1.0,
+                        help='semantic residual scale before conservative verification')
+    parser.add_argument('--stage3_max_steps', type=int, default=-1,
+                        help='optional batches per epoch for smoke tests; -1 uses all batches')
     return parser.parse_args()
 
 
@@ -136,6 +156,10 @@ def parse_test_areas(test_area):
 
 
 def main(args, logger):
+    if args.stage3_enable and (args.refine_freeze_backbone or args.refine_teacher_ckpt_dir):
+        raise ValueError('Stage 3 jointly trains the backbone and cannot use the frozen-teacher mode.')
+    if args.stage3_enable and args.learnable_sp_enable:
+        raise ValueError('Choose the Stage-3 decomposer or the legacy learnable superpoint experiment, not both.')
     if args.refine_teacher_ckpt_dir:
         args.refine_enable = True
         args.refine_freeze_backbone = True
@@ -153,6 +177,7 @@ def main(args, logger):
     logger.info(f"REFINE_ENABLE(error-query refinement) set to: {args.refine_enable}")
     logger.info(f"REFINE_FREEZE_BACKBONE set to: {args.refine_freeze_backbone}")
     logger.info(f"LEARNABLE_SP_ENABLE(training-integrated structure) set to: {args.learnable_sp_enable}")
+    logger.info(f"STAGE3_ENABLE(split + Candidate-based Refiner + Conservative Verifier) set to: {args.stage3_enable}")
     logger.info("------------------------------")
     backup_selected(args)
     all_areas = ['Area_1', 'Area_2', 'Area_3', 'Area_4', 'Area_5', 'Area_6']
@@ -174,16 +199,16 @@ def main(args, logger):
     model = build_model(args.model, in_channels=args.input_dim, out_channels=args.primitive_num, conv1_kernel_size=args.conv1_kernel_size, config=args)
     # logger.info(model)
     model = model.cuda()
-    refiner = None
-    if args.refine_enable:
-        refiner = ErrorQueryRefiner(
+    candidate_refiner = None
+    if args.refine_enable or args.stage3_enable:
+        candidate_refiner = CandidateBasedRefiner(
             feat_dim=args.feats_dim,
             num_classes=args.semantic_class,
             hidden_dim=args.refine_hidden_dim,
             num_heads=args.refine_num_heads,
             dropout=args.refine_dropout,
         ).cuda()
-        logger.info(refiner)
+        logger.info(candidate_refiner)
     learnable_sp = None
     if args.learnable_sp_enable:
         learnable_sp = SemanticDifferenceSuperpointLearner(
@@ -199,8 +224,10 @@ def main(args, logger):
     if not args.refine_freeze_backbone:
         optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, dampening=args.dampening, weight_decay=args.weight_decay)
     refiner_optimizer = None
-    if refiner is not None:
-        refiner_optimizer = torch.optim.AdamW(refiner.parameters(), lr=args.refine_lr, weight_decay=args.refine_weight_decay)
+    if args.refine_enable:
+        refiner_optimizer = torch.optim.AdamW(
+            candidate_refiner.parameters(), lr=args.refine_lr, weight_decay=args.refine_weight_decay
+        )
     learnable_sp_optimizer = None
     if learnable_sp is not None:
         learnable_sp_optimizer = torch.optim.AdamW(
@@ -210,7 +237,7 @@ def main(args, logger):
         )
     scheduler = None if optimizer is None else PolyLR(optimizer, max_iter=args.max_iter[0])
     start_epoch, start_grow_epoch, is_Growing = load_resume_checkpoint(
-        args, model, optimizer, scheduler, logger, refiner=refiner,
+        args, model, optimizer, scheduler, logger, refiner=candidate_refiner,
         learnable_sp=learnable_sp, learnable_sp_optimizer=learnable_sp_optimizer,
     )
     teacher_classifier = None
@@ -224,13 +251,17 @@ def main(args, logger):
     if is_Growing and optimizer is not None:
         scheduler = PolyLR(optimizer, max_iter=args.max_iter[1])
         start_epoch, start_grow_epoch, is_Growing = load_resume_checkpoint(
-            args, model, optimizer, scheduler, logger, refiner=refiner,
+            args, model, optimizer, scheduler, logger, refiner=candidate_refiner,
             learnable_sp=learnable_sp, learnable_sp_optimizer=learnable_sp_optimizer,
         )
 
     loss = torch.nn.CrossEntropyLoss(ignore_index=-1).cuda()
     classifier = None
     primitive_to_semantic = None
+    if args.stage3_enable and args.resume:
+        classifier, primitive_to_semantic = restore_structure_state(
+            args, model, logger
+        )
 
     '''Train and Cluster'''
     '''Superpoints will not Grow in 1st Stage'''
@@ -244,17 +275,19 @@ def main(args, logger):
                 structure_classifier=classifier, structure_mapping=primitive_to_semantic,
                 learnable_sp=learnable_sp,
             )
-            refiner_optimizer = maybe_reset_refiner(args, refiner, logger)
+            refiner_optimizer = maybe_reset_refiner(args, candidate_refiner, logger)
         train(
             train_loader, logger, model, optimizer, loss, epoch, scheduler, classifier, primitive_to_semantic,
-            refiner=refiner, refiner_optimizer=refiner_optimizer, freeze_backbone=args.refine_freeze_backbone,
+            refiner=candidate_refiner if args.refine_enable else None,
+            refiner_optimizer=refiner_optimizer, freeze_backbone=args.refine_freeze_backbone,
             learnable_sp=learnable_sp, learnable_sp_optimizer=learnable_sp_optimizer,
         )
 
         if epoch % 10 == 0:
             save_checkpoints(
                 args, epoch, model, optimizer, scheduler, classifier, is_Growing, start_grow_epoch, logger,
-                refiner=refiner, learnable_sp=learnable_sp, learnable_sp_optimizer=learnable_sp_optimizer,
+                refiner=candidate_refiner if args.refine_enable else None,
+                learnable_sp=learnable_sp, learnable_sp_optimizer=learnable_sp_optimizer,
             )
             with torch.no_grad():
                 o_Acc, m_Acc, s = eval(epoch, args, test_areas)
@@ -285,22 +318,84 @@ def main(args, logger):
                 structure_classifier=classifier, structure_mapping=primitive_to_semantic,
                 learnable_sp=learnable_sp,
             )
-            refiner_optimizer = maybe_reset_refiner(args, refiner, logger)
+            refiner_optimizer = maybe_reset_refiner(args, candidate_refiner, logger)
         train(
             train_loader, logger, model, optimizer, loss, epoch, scheduler, classifier, primitive_to_semantic,
-            refiner=refiner, refiner_optimizer=refiner_optimizer, freeze_backbone=args.refine_freeze_backbone,
+            refiner=candidate_refiner if args.refine_enable else None,
+            refiner_optimizer=refiner_optimizer, freeze_backbone=args.refine_freeze_backbone,
             learnable_sp=learnable_sp, learnable_sp_optimizer=learnable_sp_optimizer,
         )
 
         if epoch % 10 == 0:
             save_checkpoints(
                 args, epoch, model, optimizer, scheduler, classifier, is_Growing, start_grow_epoch, logger,
-                refiner=refiner, learnable_sp=learnable_sp, learnable_sp_optimizer=learnable_sp_optimizer,
+                refiner=candidate_refiner if args.refine_enable else None,
+                learnable_sp=learnable_sp, learnable_sp_optimizer=learnable_sp_optimizer,
             )
             with torch.no_grad():
                 o_Acc, m_Acc, s = eval(epoch, args, test_areas)
                 logger.info('Epoch: {:02d}, oAcc {:.2f}  mAcc {:.2f} IoUs'.format(epoch, o_Acc, m_Acc) + s)
                 log_refine_eval_stats(args, logger, epoch)
+
+    # Stage 3 starts only after GrowSP has completed progressive growing. The
+    # decomposed regions participate in feature aggregation and pseudo-label
+    # regeneration; verified candidate targets then update both network parts.
+    if args.stage3_enable:
+        logger.info('############################################################')
+        logger.info('### Stage 3: Split + Candidate Refiner + Conservative Verify')
+        logger.info('############################################################')
+        stage3_config = Stage3Config(residual_scale=args.stage3_residual_scale)
+        superpoint_decomposer = SuperpointDecomposer(stage3_config)
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=args.stage3_lr, momentum=args.momentum,
+            dampening=args.dampening, weight_decay=args.weight_decay,
+        )
+        refiner_optimizer = torch.optim.AdamW(
+            candidate_refiner.parameters(), lr=args.stage3_refiner_lr,
+            weight_decay=args.refine_weight_decay,
+        )
+        scheduler = PolyLR(
+            optimizer,
+            max_iter=max(args.stage3_epochs * len(train_loader), 1),
+        )
+        stage3_end = stage2_end + args.stage3_epochs
+        stage3_start = max(start_epoch, stage2_end)
+        for epoch in range(stage3_start + 1, stage3_end + 1):
+            if classifier is None or (epoch - stage2_end - 1) % 10 == 0:
+                classifier, primitive_to_semantic = cluster(
+                    args, logger, cluster_loader, model, epoch, start_grow_epoch, True,
+                    structure_classifier=classifier,
+                    structure_mapping=primitive_to_semantic,
+                    superpoint_module=superpoint_decomposer,
+                )
+            train_stage3(
+                train_loader,
+                logger,
+                model,
+                optimizer,
+                scheduler,
+                classifier,
+                primitive_to_semantic,
+                candidate_refiner,
+                refiner_optimizer,
+                stage3_config,
+                epoch,
+            )
+
+            if epoch % 10 == 0 or epoch == stage3_end:
+                args.training_stage = 'stage3'
+                save_checkpoints(
+                    args, epoch, model, optimizer, scheduler, classifier, True,
+                    start_grow_epoch, logger, refiner=candidate_refiner,
+                    refiner_optimizer=refiner_optimizer,
+                )
+                with torch.no_grad():
+                    o_Acc, m_Acc, s = eval(epoch, args, test_areas)
+                    logger.info(
+                        'Stage 3 Epoch: {:02d}, oAcc {:.2f} mAcc {:.2f} IoUs'.format(
+                            epoch, o_Acc, m_Acc
+                        ) + s
+                    )
 
 
 def resolve_teacher_epoch(ckpt_dir, requested_epoch):
@@ -332,6 +427,26 @@ def _extract_state_dict(checkpoint, key):
     return checkpoint
 
 
+def restore_structure_state(args, model, logger):
+    """Restore the Stage-2 classifier needed by the first Stage-3 split round."""
+    checkpoint = torch.load(args.resume, map_location='cpu')
+    state = checkpoint.get('classifier_state_dict')
+    if state is None:
+        logger.info('Resume checkpoint has no classifier; Stage 3 will initialize it by clustering.')
+        return None, None
+    classifier = torch.nn.Linear(args.feats_dim, args.primitive_num, bias=False)
+    classifier.load_state_dict(state)
+    classifier = classifier.to(next(model.parameters()).device)
+    mapping = KMeans(
+        n_clusters=args.semantic_class,
+        n_init=10,
+        random_state=0,
+        n_jobs=5,
+    ).fit_predict(classifier.weight.detach().cpu().numpy())
+    logger.info('Restored Stage-2 classifier and semantic mapping for Stage-3 decomposition.')
+    return classifier, torch.from_numpy(mapping).long()
+
+
 def load_frozen_teacher(args, model, logger):
     teacher_epoch = resolve_teacher_epoch(args.refine_teacher_ckpt_dir, args.refine_teacher_epoch)
     model_path = os.path.join(args.refine_teacher_ckpt_dir, f'model_{teacher_epoch}_checkpoint.pth')
@@ -359,7 +474,8 @@ def freeze_backbone(model):
 
 def cluster(
     args, logger, cluster_loader, model, epoch, start_grow_epoch=None, is_Growing=False,
-    teacher_classifier=None, structure_classifier=None, structure_mapping=None, learnable_sp=None,
+    teacher_classifier=None, structure_classifier=None, structure_mapping=None,
+    learnable_sp=None, superpoint_module=None,
 ):
     time_start = time.time()
     cluster_loader.dataset.mode = 'cluster'
@@ -377,8 +493,9 @@ def cluster(
         logger.info('Epoch: {}, Superpoints Grow to {}'.format(epoch, current_growsp))
 
     '''Extract Superpoints Feature'''
+    active_superpoint_module = superpoint_module or learnable_sp
     structure_centers = None
-    if learnable_sp is not None and structure_classifier is not None and structure_mapping is not None:
+    if active_superpoint_module is not None and structure_classifier is not None and structure_mapping is not None:
         structure_centers = build_semantic_classifier(
             structure_classifier, structure_mapping, args.semantic_class
         )
@@ -387,14 +504,14 @@ def cluster(
         cluster_loader,
         model,
         current_growsp,
-        learnable_sp=learnable_sp,
+        superpoint_module=active_superpoint_module,
         semantic_centers=structure_centers,
     )
-    structure_stats = getattr(args, 'cluster_learnable_sp_stats', None)
+    structure_stats = getattr(args, 'cluster_superpoint_stats', None)
     if structure_stats and structure_stats['scenes'] > 0:
         coverage = structure_stats['supervised_points'] / max(structure_stats['valid_points'], 1)
         logger.info(
-            'Epoch: {}, learned structure reclustering: scenes {}, candidates {}, accepted {}, coverage {:.2f}%'.format(
+            'Epoch: {}, split-aware reclustering: scenes {}, candidates {}, accepted {}, coverage {:.2f}%'.format(
                 epoch,
                 structure_stats['scenes'],
                 structure_stats['candidate_regions'],
@@ -740,6 +857,114 @@ def train(
             time_curr = time.time()
             loss_display = 0
             losses_display.clear()
+
+
+def train_stage3(
+    train_loader,
+    logger,
+    model,
+    optimizer,
+    scheduler,
+    classifier,
+    primitive_to_semantic,
+    candidate_refiner,
+    refiner_optimizer,
+    stage3_config,
+    epoch,
+):
+    """Jointly train GrowSP and the candidate refiner after superpoint growing."""
+    train_loader.dataset.mode = 'train'
+    model.train()
+    candidate_refiner.train()
+    semantic_centers = build_semantic_classifier(
+        classifier, primitive_to_semantic, args.semantic_class
+    ).detach()
+    running = {
+        'total': 0.0,
+        'primitive': 0.0,
+        'split': 0.0,
+        'refiner': 0.0,
+        'candidate_points': 0,
+        'accepted_points': 0,
+        'steps': 0,
+    }
+
+    for batch_idx, data in enumerate(train_loader):
+        if args.stage3_max_steps > 0 and batch_idx >= args.stage3_max_steps:
+            break
+        coords, features, _, _, _, pseudo_labels, inds, region, _ = data
+        in_field = ME.TensorField(features, coords, device=0)
+        model_out = model(in_field)
+        feats = model_out[0] if isinstance(model_out, tuple) else model_out
+        feats = F.normalize(feats[inds.long()], dim=-1)
+
+        pseudo_labels = pseudo_labels.long().cuda()
+        primitive_logits = F.linear(feats, F.normalize(classifier.weight))
+        primitive_loss = F.cross_entropy(
+            primitive_logits * 3, pseudo_labels, ignore_index=-1
+        )
+        semantic_logits = F.linear(feats, semantic_centers)
+        point_coords = coords[inds.long(), 1:].float().cuda()
+        point_batch_ids = coords[inds.long(), 0].long().cuda()
+        point_colors = features[inds.long(), :3].float().cuda()
+        point_regions = region.view(-1).long().cuda()
+
+        output = run_stage3_pipeline(
+            stage3_config,
+            candidate_refiner,
+            feats,
+            point_coords,
+            point_colors,
+            semantic_logits,
+            point_regions,
+            point_batch_ids,
+        )
+        stage3_losses = stage3_training_losses(
+            stage3_config,
+            output,
+            keep_weight=args.refine_keep_lambda,
+            residual_weight=args.refine_delta_lambda,
+        )
+        total_loss = (
+            primitive_loss
+            + args.stage3_structure_lambda * stage3_losses['backbone']
+            + args.stage3_refiner_lambda * stage3_losses['refiner']
+        )
+
+        optimizer.zero_grad()
+        refiner_optimizer.zero_grad()
+        total_loss.backward()
+        optimizer.step()
+        refiner_optimizer.step()
+        scheduler.step()
+
+        verifier_stats = output.verification.statistics
+        running['total'] += float(total_loss.detach().item())
+        running['primitive'] += float(primitive_loss.detach().item())
+        running['split'] += float(stage3_losses['backbone'].detach().item())
+        running['refiner'] += float(stage3_losses['refiner'].detach().item())
+        running['candidate_points'] += verifier_stats['candidate_points']
+        running['accepted_points'] += verifier_stats['accepted_points']
+        running['steps'] += 1
+
+        if (batch_idx + 1) % args.log_interval == 0:
+            steps = max(running['steps'], 1)
+            candidates = max(running['candidate_points'], 1)
+            logger.info(
+                'Stage 3 Epoch {:02d} [{}/{}] loss {:.4f} primitive {:.4f} '
+                'split {:.4f} refiner {:.4f} accepted {:.2f}%'.format(
+                    epoch,
+                    batch_idx + 1,
+                    len(train_loader),
+                    running['total'] / steps,
+                    running['primitive'] / steps,
+                    running['split'] / steps,
+                    running['refiner'] / steps,
+                    100.0 * running['accepted_points'] / candidates,
+                )
+            )
+            for key in running:
+                running[key] = 0.0 if key not in ('candidate_points', 'accepted_points', 'steps') else 0
 
 
 from torch.optim.lr_scheduler import LambdaLR

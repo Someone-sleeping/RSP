@@ -7,9 +7,10 @@ from torch.utils.data import DataLoader
 from sklearn.utils.linear_assignment_ import linear_assignment  # pip install scikit-learn==0.22.2
 from sklearn.cluster import KMeans
 from models.fpn import Res16FPN18
-from models.query_refiner import ErrorQueryRefiner
+from models.query_refiner import CandidateBasedRefiner
 from lib.error_query import build_error_queries
 from lib.split_regions import build_region_consistency_queries, build_split_region_queries, build_uncertain_region_queries
+from lib.stage3_pipeline import Stage3Config, run_stage3_pipeline
 from lib.utils import get_fixclassifier
 import warnings
 import argparse
@@ -106,6 +107,9 @@ def parse_args():
     parser.add_argument('--split_multi_proposal', action='store_true', default=False)
     parser.add_argument('--split_selection_mode', type=str, default='score', choices=['score', 'random'])
     parser.add_argument('--split_random_seed', type=int, default=0)
+    parser.add_argument('--stage3_enable', action='store_true', default=False,
+                        help='evaluate the training-integrated Stage-3 checkpoint')
+    parser.add_argument('--stage3_residual_scale', type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -263,7 +267,44 @@ def eval_once(args, model, test_loader, classifier, primitive_classifier=None, c
 
             region = region.squeeze()
             #
-            if refiner is not None:
+            if refiner is not None and getattr(args, 'stage3_enable', False):
+                base_scores = F.linear(F.normalize(feats), F.normalize(classifier.weight))
+                point_batch_ids = coords[:, 0].long().cuda()
+                point_coords = coords[:, 1:].float().cuda()
+                point_colors = features[:, :3].float().cuda()
+                stage3_output = run_stage3_pipeline(
+                    Stage3Config(residual_scale=args.stage3_residual_scale),
+                    refiner,
+                    feats,
+                    point_coords,
+                    point_colors,
+                    base_scores,
+                    region.cuda(),
+                    point_batch_ids,
+                )
+                base_preds = torch.argmax(base_scores, dim=1).cpu()
+                preds = torch.argmax(
+                    stage3_output.verification.verified_logits, dim=1
+                ).cpu()
+                changed = preds != base_preds
+                split = stage3_output.split
+                verification = stage3_output.verification
+                stats["changed_points"] += int(changed.sum().item())
+                stats["trusted_points"] += int(split.candidate_mask.sum().item())
+                stats["keep_points"] += int(split.keep_mask.sum().item())
+                stats["total_points"] += int(preds.numel())
+                stats["queries"] += int(split.query_indices.numel())
+                stats["split_regions"] += int(split.statistics["split_regions"])
+                stats["changed_trusted_points"] += int(
+                    (changed & split.candidate_mask.cpu()).sum().item()
+                )
+                stats["accepted_points"] = stats.get("accepted_points", 0) + int(
+                    verification.accept_mask.sum().item()
+                )
+                stats["rollback_points"] = stats.get("rollback_points", 0) + int(
+                    verification.rollback_mask.sum().item()
+                )
+            elif refiner is not None:
                 if getattr(args, 'semantic_logit_source', 'centroid') == 'primitive_reduce' and primitive_classifier is not None and cluster_pred is not None:
                     primitive_scores = F.linear(F.normalize(feats), F.normalize(primitive_classifier.weight))
                     base_scores = reduce_primitive_logits(
@@ -511,12 +552,12 @@ def eval(epoch, args, test_areas = ['Area_5']):
     classifier.eval()
 
     refiner = None
-    if getattr(args, 'refine_enable', False):
+    if getattr(args, 'refine_enable', False) or getattr(args, 'stage3_enable', False):
         refiner_path = os.path.join(args.save_path, 'refiner_' + str(epoch) + '_checkpoint.pth')
         if not os.path.exists(refiner_path):
             refiner_path = os.path.join(args.save_path, 'ckpts', 'refiner_' + str(epoch) + '_checkpoint.pth')
         if os.path.exists(refiner_path):
-            refiner = ErrorQueryRefiner(
+            refiner = CandidateBasedRefiner(
                 feat_dim=args.feats_dim,
                 num_classes=args.semantic_class,
                 hidden_dim=getattr(args, 'refine_hidden_dim', 128),
@@ -565,6 +606,8 @@ def eval(epoch, args, test_areas = ['Area_5']):
     })
     args.eval_refine_stats = refine_stats
 
+    if getattr(args, 'stage3_enable', False) and refiner is not None:
+        return refined_o_Acc, refined_m_Acc, refined_s
     return o_Acc, m_Acc, s
 
 
@@ -577,7 +620,7 @@ if __name__ == '__main__':
     o_Acc, m_Acc, s = eval(epoch, args, parse_test_areas(args.test_area))
     print('Epoch: {}, oAcc {:.2f}  mAcc {:.2f} IoUs'.format(epoch, o_Acc, m_Acc), s)
     stats = getattr(args, 'eval_refine_stats', None)
-    if stats and args.refine_enable:
+    if stats and (args.refine_enable or args.stage3_enable):
         print(
             'Epoch: {}, Refined oAcc {:.2f}  mAcc {:.2f}  delta_mIoU {:+.2f}  '
             'changed {:.2f}% trusted {:.2f}% keep {:.2f}% changed@trusted {:.2f}% queries {} split_regions {} consistency_regions {}'.format(
