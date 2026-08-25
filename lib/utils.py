@@ -9,6 +9,34 @@ import MinkowskiEngine as ME
 from tqdm import tqdm
 from .my_utils import VisualizationThreadPool
 
+
+def enforce_cannot_link(sp_index, region_features, region_sizes, cannot_link_pairs):
+    """Prevent verified split siblings from immediately merging into one cluster."""
+    if cannot_link_pairs is None or cannot_link_pairs.numel() == 0:
+        return sp_index, 0
+    sp_index = sp_index.clone()
+    features = region_features.detach().cpu().float()
+    sizes = region_sizes.detach().cpu().view(-1)
+    prevented = 0
+    for pair in cannot_link_pairs.detach().cpu().long():
+        first, second = int(pair[0].item()), int(pair[1].item())
+        if sp_index[first] != sp_index[second]:
+            continue
+        moving = first if sizes[first] <= sizes[second] else second
+        forbidden_cluster = int(sp_index[first].item())
+        alternatives = torch.unique(sp_index)
+        alternatives = alternatives[alternatives != forbidden_cluster]
+        if alternatives.numel() == 0:
+            continue
+        centers = []
+        for cluster_id in alternatives:
+            centers.append(features[sp_index == cluster_id].mean(dim=0))
+        centers = torch.stack(centers)
+        nearest = torch.argmin(torch.norm(centers - features[moving], dim=1))
+        sp_index[moving] = alternatives[nearest]
+        prevented += 1
+    return sp_index, prevented
+
 def get_sp_feature(
     args, loader, model, current_growsp, vis=False,
     learnable_sp=None, semantic_centers=None, superpoint_module=None,
@@ -31,6 +59,7 @@ def get_sp_feature(
         'accepted_splits': 0,
         'supervised_points': 0,
         'valid_points': 0,
+        'prevented_remerges': 0,
     }
     if superpoint_module is not None:
         superpoint_module.eval()
@@ -42,6 +71,7 @@ def get_sp_feature(
             scene_name = loader.dataset.name[index[0]]
             gt = labels.clone()
             raw_region = region.clone()
+            cannot_link_pairs = None
 
             in_field = ME.TensorField(features, coords, device=0)
 
@@ -82,6 +112,9 @@ def get_sp_feature(
                     min_semantic_separation=getattr(args, 'learnable_sp_semantic_sep', 0.15),
                 )
                 region = structure_output.dynamic_regions.cpu()
+                if hasattr(structure_output, 'refined_features'):
+                    feats = structure_output.refined_features
+                cannot_link_pairs = getattr(structure_output, 'cannot_link_pairs', None)
                 structure_stats['scenes'] += 1
                 structure_stats['candidate_regions'] += structure_output.stats['selected_regions']
                 structure_stats['accepted_splits'] += structure_output.stats['accepted_splits']
@@ -117,6 +150,13 @@ def get_sp_feature(
                 # sp_idx_bf = torch.from_numpy(KMeans(n_clusters=n_segments + 1, n_init=5, random_state=0, n_jobs=5).fit_predict(region_feats.cpu().numpy())).long()
                 # sp_idx = masked_kmeans_consensus(region_feats, n_segments, n_rounds=10, mask_prob=0.3)
                 sp_idx = torch.from_numpy(KMeans(n_clusters=n_segments, n_init=5, random_state=0, n_jobs=5).fit_predict(region_feats.cpu().numpy())).long()
+                sp_idx, prevented = enforce_cannot_link(
+                    sp_idx,
+                    region_feats,
+                    per_region_num,
+                    cannot_link_pairs,
+                )
+                structure_stats['prevented_remerges'] += prevented
             else:
                 feats = region_feats
                 sp_idx = torch.tensor(range(region_feats.size(0)))

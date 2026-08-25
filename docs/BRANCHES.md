@@ -20,6 +20,7 @@ older experiment branch.
 | `exp/four-stage-dataset-specific-ckpts` | `7068609` | Correct 45.84 four-stage protocol with dataset-specific Refiner checkpoints and hash binding |
 | `exp/scannet-data-logosp-meta-calibration` | `0f90005` | ScanNet data audit and LogoSP candidate-gating calibration |
 | `exp/stage3-split-candidate-refiner-verifier` | `0f90005` | Training-integrated Stage 3 with superpoint split, Candidate-based Refiner, and Conservative Verifier |
+| `exp/stage2-split-feature-refiner` | `28adac4` | Stage-2 dynamic superpoint split, feature-space Candidate Refiner, and conservative structure verification |
 
 The learnable-structure branch starts from
 `exp/decomposition-meta-refiner-verifier`, preserving the earlier unified
@@ -42,3 +43,8 @@ Meta adaptation from the primary method, and preserves the old frozen
 evaluation path only for numerical regression. Its primary path starts after
 GrowSP growing and feeds verified region structure and targets back into joint
 unsupervised training.
+
+The Stage-2 feature-refiner branch moves structure correction into GrowSP's
+progressive growing stage. It resumes a completed Stage 1, updates dynamic
+superpoints before pseudo-label regeneration, and jointly trains the backbone
+and a candidate-gated contextual feature adapter.

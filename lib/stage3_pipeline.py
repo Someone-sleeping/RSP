@@ -71,7 +71,7 @@ class Stage3Output:
     verification: VerificationOutput
 
 
-def _reindex_split_regions(regions, batch_ids, split_targets):
+def reindex_split_regions(regions, batch_ids, split_targets):
     """Turn accepted child targets into contiguous superpoint identifiers."""
     regions = regions.view(-1).long()
     batch_ids = batch_ids.view(-1).long().to(regions.device)
@@ -127,7 +127,7 @@ def split_superpoints(config, point_features, coordinates, colors, semantic_logi
             semantic_weight=config.semantic_weight,
         )
     )
-    dynamic_regions = _reindex_split_regions(regions, batch_ids, targets)
+    dynamic_regions = reindex_split_regions(regions, batch_ids, targets)
     return SuperpointSplitOutput(
         query_indices=queries,
         candidate_mask=candidate_mask,
