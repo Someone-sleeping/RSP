@@ -17,7 +17,12 @@ from models.learnable_superpoint import (
     verified_region_supervision_loss,
 )
 from eval_S3DIS import eval
-from lib.utils import get_pseudo, get_sp_feature, get_fixclassifier
+from lib.utils import (
+    build_split_primitive_overrides,
+    get_pseudo,
+    get_sp_feature,
+    get_fixclassifier,
+)
 from lib.error_query import build_error_queries
 from lib.stage3_pipeline import (
     Stage3Config,
@@ -156,23 +161,32 @@ def parse_args():
                         help='treat the resumed Stage-1 epoch as the start of GrowSP Stage 2')
     parser.add_argument('--stage2_split_refine_enable', action='store_true', default=False,
                         help='enable split-aware contextual feature refinement during Stage 2')
-    parser.add_argument('--stage2_split_start_ratio', type=float, default=0.0,
+    parser.add_argument('--stage2_split_start_ratio', type=float, default=0.75,
                         help='fraction of Stage 2 completed before split-aware refinement starts')
     parser.add_argument('--stage2_feature_refiner_lr', type=float, default=1e-4)
     parser.add_argument('--stage2_feature_residual_scale', type=float, default=0.1)
     parser.add_argument('--stage2_split_lambda', type=float, default=0.2)
     parser.add_argument('--stage2_feature_lambda', type=float, default=0.1)
     parser.add_argument('--stage2_residual_lambda', type=float, default=0.01)
+    parser.add_argument('--stage2_refiner_primitive_lambda', type=float, default=0.5)
     parser.add_argument('--stage2_min_region_points', type=int, default=20)
     parser.add_argument('--stage2_min_child_points', type=int, default=8)
     parser.add_argument('--stage2_max_regions', type=int, default=20)
     parser.add_argument('--stage2_purity_th', type=float, default=0.92)
     parser.add_argument('--stage2_entropy_th', type=float, default=0.25)
-    parser.add_argument('--stage2_min_split_conf', type=float, default=0.15)
-    parser.add_argument('--stage2_verifier_tolerance', type=float, default=0.02)
-    parser.add_argument('--stage2_max_residual_norm', type=float, default=5.0)
+    parser.add_argument('--stage2_min_split_conf', type=float, default=0.35)
+    parser.add_argument('--stage2_verifier_tolerance', type=float, default=0.0)
+    parser.add_argument('--stage2_max_residual_norm', type=float, default=1.0)
+    parser.add_argument('--stage2_min_structure_gain', type=float, default=0.01)
+    parser.add_argument('--stage2_min_child_separation', type=float, default=0.05)
+    parser.add_argument('--stage2_min_primitive_gain', type=float, default=0.005)
+    parser.add_argument('--stage2_min_primitive_margin', type=float, default=0.01)
+    parser.add_argument('--stage2_override_min_gain', type=float, default=0.05)
+    parser.add_argument('--stage2_override_min_margin', type=float, default=0.02)
     parser.add_argument('--stage2_max_steps', type=int, default=-1,
                         help='optional batches per Stage-2 epoch for smoke tests; -1 uses all batches')
+    parser.add_argument('--stage2_stop_epoch', type=int, default=-1,
+                        help='optional absolute epoch for short Stage-2 diagnostics; -1 runs full Stage 2')
     return parser.parse_args()
 
 
@@ -256,12 +270,18 @@ def main(args, logger):
     stage2_feature_config = None
     stage2_feature_module = None
     if args.stage2_split_refine_enable:
+        # Auxiliary-module initialization must not alter the backbone's data
+        # shuffle or augmentation stream in paired Stage-2 experiments.
+        cpu_rng_state = torch.get_rng_state()
+        cuda_rng_state = torch.cuda.get_rng_state_all()
         feature_refiner = CandidateFeatureRefiner(
             feat_dim=args.feats_dim,
             hidden_dim=args.refine_hidden_dim,
             num_heads=args.refine_num_heads,
             dropout=args.refine_dropout,
         ).cuda()
+        torch.set_rng_state(cpu_rng_state)
+        torch.cuda.set_rng_state_all(cuda_rng_state)
         stage2_feature_config = Stage2FeatureConfig(
             residual_scale=args.stage2_feature_residual_scale,
             min_region_points=args.stage2_min_region_points,
@@ -272,6 +292,10 @@ def main(args, logger):
             min_split_confidence=args.stage2_min_split_conf,
             verifier_tolerance=args.stage2_verifier_tolerance,
             max_residual_norm=args.stage2_max_residual_norm,
+            min_structure_gain=args.stage2_min_structure_gain,
+            min_child_separation=args.stage2_min_child_separation,
+            min_primitive_gain=args.stage2_min_primitive_gain,
+            min_primitive_margin=args.stage2_min_primitive_margin,
         )
         stage2_feature_module = Stage2FeatureModule(feature_refiner, stage2_feature_config)
         logger.info(feature_refiner)
@@ -387,8 +411,11 @@ def main(args, logger):
     '''Superpoints will grow in 2nd Stage'''
     current_epoch = max(start_epoch, start_grow_epoch)
     stage2_end = start_grow_epoch + args.max_epoch[1]
+    stage2_loop_end = stage2_end
+    if args.stage2_stop_epoch > 0:
+        stage2_loop_end = min(stage2_loop_end, args.stage2_stop_epoch)
     split_refine_was_active = False
-    for epoch in range(current_epoch + 1, stage2_end + 1):
+    for epoch in range(current_epoch + 1, stage2_loop_end + 1):
         stage2_progress = (epoch - start_grow_epoch) / max(float(args.max_epoch[1]), 1.0)
         split_refine_active = (
             args.stage2_split_refine_enable
@@ -422,7 +449,7 @@ def main(args, logger):
                 learnable_sp=learnable_sp, learnable_sp_optimizer=learnable_sp_optimizer,
             )
 
-        if epoch % 10 == 0 or epoch == stage2_end:
+        if epoch % 10 == 0 or epoch == stage2_loop_end:
             args.training_stage = 'stage2_split_feature_refiner' if split_refine_active else 'growsp_stage2'
             save_checkpoints(
                 args, epoch, model, optimizer, scheduler, classifier, is_Growing, start_grow_epoch, logger,
@@ -436,6 +463,13 @@ def main(args, logger):
                 logger.info('Epoch: {:02d}, oAcc {:.2f}  mAcc {:.2f} IoUs'.format(epoch, o_Acc, m_Acc) + s)
                 log_refine_eval_stats(args, logger, epoch)
         split_refine_was_active = split_refine_active
+
+    if stage2_loop_end < stage2_end:
+        logger.info(
+            'Stopped Stage 2 diagnostic at epoch %d (full Stage 2 ends at %d).',
+            stage2_loop_end, stage2_end,
+        )
+        return
 
     # Stage 3 starts only after GrowSP has completed progressive growing. The
     # decomposed regions participate in feature aggregation and pseudo-label
@@ -599,6 +633,10 @@ def cluster(
         structure_centers = build_semantic_classifier(
             structure_classifier, structure_mapping, args.semantic_class
         )
+        if hasattr(active_superpoint_module, 'set_reference_primitives'):
+            active_superpoint_module.set_reference_primitives(
+                structure_classifier.weight, structure_mapping
+            )
     feats, labels, sp_index, context = get_sp_feature(
         args,
         cluster_loader,
@@ -652,7 +690,30 @@ def cluster(
     primitive_centers_np = primitive_centers.cpu().numpy()
 
     '''Compute and Save Pseudo Labels'''
-    all_pseudo, all_gt, all_pseudo_gt, sp_gt_labels, pe_gt_labels = get_pseudo(args, context, primitive_labels, sp_index)
+    primitive_overrides = None
+    if active_superpoint_module is not None and getattr(active_superpoint_module, 'apply_after_grow', False):
+        primitive_overrides, override_stats = build_split_primitive_overrides(
+            context,
+            primitive_centers,
+            primitive_labels,
+            sp_index,
+            min_gain=args.stage2_override_min_gain,
+            min_margin=args.stage2_override_min_margin,
+        )
+        logger.info(
+            'Epoch: %d, local primitive overrides: children %d, points %d, changed %.3f%%',
+            epoch,
+            override_stats['children'],
+            override_stats['points'],
+            100.0 * override_stats['points'] / max(override_stats['valid_points'], 1),
+        )
+    all_pseudo, all_gt, all_pseudo_gt, sp_gt_labels, pe_gt_labels = get_pseudo(
+        args,
+        context,
+        primitive_labels,
+        sp_index,
+        primitive_overrides=primitive_overrides,
+    )
     logger.info('labelled points ratio %.2f clustering time: %.2fs', (all_pseudo!=-1).sum()/all_pseudo.shape[0], time.time() - time_start)
     if (pe_gt_labels < 0).any():
         print("存在未赋值标签")
@@ -983,6 +1044,7 @@ def train_stage2_split_refiner(
     running = {
         'total': 0.0,
         'primitive': 0.0,
+        'refiner_primitive_delta': 0.0,
         'split': 0.0,
         'feature': 0.0,
         'accepted': 0,
@@ -1014,6 +1076,8 @@ def train_stage2_split_refiner(
             semantic_logits,
             point_regions,
             point_batch_ids,
+            classifier.weight,
+            primitive_to_semantic,
         )
         base_logits = F.linear(point_features, F.normalize(classifier.weight))
         refined_logits = F.linear(
@@ -1025,10 +1089,15 @@ def train_stage2_split_refiner(
         refined_primitive_loss = F.cross_entropy(
             refined_logits * 3, pseudo_labels, ignore_index=-1
         )
-        primitive_loss = 0.5 * (base_primitive_loss + refined_primitive_loss)
+        # Preserve the original GrowSP gradient on the backbone. The detached
+        # Refiner branch learns to improve primitive support without injecting
+        # its noisier 12-class proxy gradients directly into point features.
+        primitive_loss = base_primitive_loss
+        refiner_primitive_delta = refined_primitive_loss - base_primitive_loss.detach()
         feature_losses = stage2_feature_losses(output, semantic_centers)
         total_loss = (
             primitive_loss
+            + args.stage2_refiner_primitive_lambda * refiner_primitive_delta
             + args.stage2_split_lambda * feature_losses['semantic']
             + args.stage2_feature_lambda * feature_losses['structure']
             + args.stage2_residual_lambda * feature_losses['residual']
@@ -1043,6 +1112,7 @@ def train_stage2_split_refiner(
 
         running['total'] += float(total_loss.detach().item())
         running['primitive'] += float(primitive_loss.detach().item())
+        running['refiner_primitive_delta'] += float(refiner_primitive_delta.detach().item())
         running['split'] += float(feature_losses['semantic'].detach().item())
         running['feature'] += float(feature_losses['structure'].detach().item())
         running['accepted'] += int(output.accept_mask.sum().item())
@@ -1054,12 +1124,13 @@ def train_stage2_split_refiner(
             candidates = max(running['candidates'], 1)
             logger.info(
                 'Stage 2 Split-Refine Epoch {:02d} [{}/{}] loss {:.4f} '
-                'primitive {:.4f} split {:.4f} feature {:.4f} accepted {:.2f}%'.format(
+                'primitive {:.4f} refiner_delta {:+.4f} split {:.4f} feature {:.4f} accepted {:.2f}%'.format(
                     epoch,
                     batch_idx + 1,
                     len(train_loader),
                     running['total'] / steps,
                     running['primitive'] / steps,
+                    running['refiner_primitive_delta'] / steps,
                     running['split'] / steps,
                     running['feature'] / steps,
                     100.0 * running['accepted'] / candidates,

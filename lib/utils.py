@@ -47,6 +47,7 @@ def get_sp_feature(
             gt = labels.clone()
             raw_region = region.clone()
             grown_region_for_training = None
+            split_override_data = None
 
             in_field = ME.TensorField(features, coords, device=0)
 
@@ -148,8 +149,14 @@ def get_sp_feature(
                         neural_region.size(0), dtype=torch.long, device=feats.device
                     ),
                 )
-                neural_region = structure_output.dynamic_regions.cpu()
-                feats = structure_output.refined_features
+                # Keep merged parent regions in the global primitive KMeans.
+                # Verified children are assigned to the resulting primitives
+                # afterwards, so a local split cannot perturb every centroid.
+                split_override_data = {
+                    'dynamic_regions': structure_output.dynamic_regions.cpu(),
+                    'refined_features': structure_output.refined_features.cpu(),
+                    'accept_mask': structure_output.accept_mask.cpu(),
+                }
                 structure_stats['scenes'] += 1
                 structure_stats['candidate_regions'] += structure_output.stats['selected_regions']
                 structure_stats['accepted_splits'] += structure_output.stats['accepted_splits']
@@ -219,12 +226,18 @@ def get_sp_feature(
             all_sp_index.append(neural_region)
 
             if vis:
-                context.append((scene_name, gt, raw_region, grown_region_for_training, coords, inverse_map))
+                context.append((
+                    scene_name, gt, raw_region, grown_region_for_training,
+                    coords, inverse_map, split_override_data,
+                ))
                 vis_path = '/home/magic/magic/cm/repositories/GrowSP/data/S3DIS/sp_vis'
                 vis_pool.submit_task(coords, scene_name, valid_mask, inverse_map, neural_region.numpy(), vis_path)
                 vis_pool.clean_up()
             else:
-                context.append((scene_name, gt, raw_region, grown_region_for_training))
+                context.append((
+                    scene_name, gt, raw_region, grown_region_for_training,
+                    split_override_data,
+                ))
 
             torch.cuda.empty_cache()
             torch.cuda.synchronize(torch.device("cuda"))
@@ -325,7 +338,56 @@ def get_kittisp_feature(args, loader, model, current_growsp):
 
 
 
-def get_pseudo(args, context, cluster_pred, all_sp_index=None):
+def build_split_primitive_overrides(
+    context,
+    primitive_centers,
+    primitive_labels,
+    all_sp_index,
+    min_gain=0.05,
+    min_margin=0.02,
+):
+    """Assign verified child regions without changing the global KMeans fit."""
+    primitive_centers = F.normalize(primitive_centers.detach().cpu(), dim=1)
+    overrides = []
+    region_offset = 0
+    stats = {'children': 0, 'points': 0, 'valid_points': 0}
+    for scene_idx, item in enumerate(context):
+        split_data = next((value for value in reversed(item) if isinstance(value, dict)), None)
+        scene_regions = all_sp_index[scene_idx].long()
+        global_regions = scene_regions + region_offset
+        parent_primitives = torch.from_numpy(primitive_labels[global_regions.numpy()]).long()
+        region_offset += int(torch.unique(scene_regions).numel())
+        stats['valid_points'] += int(scene_regions.numel())
+        if not split_data:
+            overrides.append(None)
+            continue
+        dynamic_regions = split_data['dynamic_regions'].long()
+        refined_features = F.normalize(split_data['refined_features'].float(), dim=1)
+        accept_mask = split_data['accept_mask'].bool()
+        point_override = torch.full_like(dynamic_regions, -1)
+        for child_id in torch.unique(dynamic_regions[accept_mask]):
+            child_mask = accept_mask & (dynamic_regions == child_id)
+            child_center = F.normalize(
+                refined_features[child_mask].mean(dim=0, keepdim=True), dim=1
+            )
+            scores = F.linear(child_center, primitive_centers).squeeze(0)
+            top_scores, top_ids = scores.topk(k=min(2, scores.numel()))
+            parent_id = torch.mode(parent_primitives[child_mask]).values
+            gain = top_scores[0] - scores[parent_id]
+            margin = top_scores[0] - top_scores[-1]
+            if (
+                top_ids[0] != parent_id
+                and gain >= float(min_gain)
+                and margin >= float(min_margin)
+            ):
+                point_override[child_mask] = top_ids[0].item()
+                stats['children'] += 1
+                stats['points'] += int(child_mask.sum().item())
+        overrides.append(point_override.numpy())
+    return overrides, stats
+
+
+def get_pseudo(args, context, cluster_pred, all_sp_index=None, primitive_overrides=None):
     print('computing pseduo labels...')
     pseudo_label_folder = args.pseudo_label_path + '/'
     if not os.path.exists(pseudo_label_folder):
@@ -352,7 +414,12 @@ def get_pseudo(args, context, cluster_pred, all_sp_index=None):
         pseudo_gt_tmp = pseudo_gt[valid_mask]
 
         pseudo = -np.ones_like(labels.numpy()).astype(np.int32)
-        pseudo[valid_mask] = cluster_pred[sub_cluster_pred]
+        point_pseudo = cluster_pred[sub_cluster_pred].copy()
+        if primitive_overrides is not None and primitive_overrides[i] is not None:
+            override = primitive_overrides[i]
+            override_mask = override >= 0
+            point_pseudo[override_mask] = override[override_mask]
+        pseudo[valid_mask] = point_pseudo
         scene_sp_gt = []
         for local_sp_id in np.unique(region_tmp):
             sp_point_mask = (region_tmp == local_sp_id)
@@ -388,6 +455,14 @@ def get_pseudo(args, context, cluster_pred, all_sp_index=None):
                 pseudo_label_folder + '/' + scene_name + '_grown_region.npy',
                 grown_region_full,
             )
+            split_data = next((value for value in reversed(context[i]) if isinstance(value, dict)), None)
+            if split_data:
+                split_region_full = -np.ones_like(labels.numpy()).astype(np.int32)
+                split_region_full[valid_mask] = split_data['dynamic_regions'].numpy().astype(np.int32)
+                np.save(
+                    pseudo_label_folder + '/' + scene_name + '_split_region.npy',
+                    split_region_full,
+                )
 
         all_gt.append(labels)
         all_pseudo.append(pseudo)

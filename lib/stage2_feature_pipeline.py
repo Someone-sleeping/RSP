@@ -17,9 +17,13 @@ class Stage2FeatureConfig:
     max_regions_per_scene: int = 20
     purity_threshold: float = 0.92
     entropy_threshold: float = 0.25
-    min_split_confidence: float = 0.15
-    verifier_tolerance: float = 0.02
-    max_residual_norm: float = 5.0
+    min_split_confidence: float = 0.35
+    verifier_tolerance: float = 0.0
+    max_residual_norm: float = 1.0
+    min_structure_gain: float = 0.01
+    min_child_separation: float = 0.05
+    min_primitive_gain: float = 0.005
+    min_primitive_margin: float = 0.01
     separation_weight: float = 0.25
 
     def split_config(self):
@@ -52,31 +56,94 @@ class Stage2FeatureOutput:
     stats: dict
 
 
-def _child_structure_score(features, parent_mask, targets, separation_weight):
+def _partition_statistics(features, parent_mask, targets):
     child_ids = torch.unique(targets[parent_mask & (targets >= 0)])
     if child_ids.numel() < 2:
-        return features.new_tensor(float("-inf"))
+        invalid = features.new_tensor(float("-inf"))
+        return invalid, invalid, invalid
+    parent_features = F.normalize(features[parent_mask], dim=1)
+    parent_center = F.normalize(parent_features.mean(dim=0, keepdim=True), dim=1)
+    parent_compactness = F.cosine_similarity(
+        parent_features, parent_center.expand_as(parent_features), dim=1
+    ).mean()
     centers = []
     compactness = features.new_tensor(0.0)
+    child_points = 0
     for child_id in child_ids:
         child_mask = parent_mask & (targets == child_id)
         child_features = F.normalize(features[child_mask], dim=1)
         center = F.normalize(child_features.mean(dim=0, keepdim=True), dim=1)
         centers.append(center)
-        compactness = compactness + F.cosine_similarity(
+        count = int(child_features.size(0))
+        compactness = compactness + count * F.cosine_similarity(
             child_features, center.expand_as(child_features), dim=1
         ).mean()
-    compactness = compactness / len(centers)
+        child_points += count
+    compactness = compactness / max(child_points, 1)
     separation = 1.0 - F.cosine_similarity(centers[0], centers[1], dim=1).mean()
+    return parent_compactness, compactness, separation
+
+
+def _child_structure_score(features, parent_mask, targets, separation_weight):
+    _, compactness, separation = _partition_statistics(features, parent_mask, targets)
     return compactness + float(separation_weight) * separation
 
 
-def _verify_feature_splits(config, base_features, proposed_features, residual, split, regions, batch_ids):
+def _primitive_partition_is_consistent(
+    config, features, parent_mask, targets, primitive_centers, primitive_to_semantic
+):
+    if primitive_centers is None or primitive_to_semantic is None:
+        return True
+
+    centers = F.normalize(primitive_centers.detach().to(features.device), dim=1)
+    mapping = primitive_to_semantic.detach().long().to(features.device)
+    parent_center = F.normalize(features[parent_mask].mean(dim=0, keepdim=True), dim=1)
+    parent_support = F.linear(parent_center, centers).max()
+    child_support = features.new_tensor(0.0)
+    child_points = 0
+    primitive_ids = []
+
+    for child_target in torch.unique(targets[parent_mask & (targets >= 0)]):
+        child_mask = parent_mask & (targets == child_target)
+        child_center = F.normalize(features[child_mask].mean(dim=0, keepdim=True), dim=1)
+        scores = F.linear(child_center, centers).squeeze(0)
+        top_scores, top_ids = scores.topk(k=min(2, scores.numel()))
+        margin = top_scores[0] - top_scores[-1]
+        primitive_id = top_ids[0]
+        if mapping[primitive_id] != child_target:
+            return False
+        if margin < float(config.min_primitive_margin):
+            return False
+        count = int(child_mask.sum().item())
+        child_support = child_support + count * top_scores[0]
+        child_points += count
+        primitive_ids.append(int(primitive_id.item()))
+
+    if len(set(primitive_ids)) < 2:
+        return False
+    child_support = child_support / max(child_points, 1)
+    return bool(
+        (child_support - parent_support >= float(config.min_primitive_gain)).item()
+    )
+
+
+def _verify_feature_splits(
+    config,
+    base_features,
+    proposed_features,
+    residual,
+    split,
+    regions,
+    batch_ids,
+    primitive_centers=None,
+    primitive_to_semantic=None,
+):
     accepted_targets = split.targets.clone()
     accept_mask = torch.zeros_like(split.candidate_mask)
     rollback_mask = torch.zeros_like(split.candidate_mask)
     accepted_regions = 0
     rejected_regions = 0
+    primitive_rejections = 0
     regions = regions.view(-1).long().to(base_features.device)
     batch_ids = batch_ids.view(-1).long().to(base_features.device)
 
@@ -92,23 +159,45 @@ def _verify_feature_splits(config, base_features, proposed_features, residual, s
             base_score = _child_structure_score(
                 base_features.detach(), parent_mask, split.targets, config.separation_weight
             )
+            parent_compactness, child_compactness, child_separation = _partition_statistics(
+                base_features.detach(), parent_mask, split.targets
+            )
             refined_score = _child_structure_score(
                 proposed_features.detach(), parent_mask, split.targets, config.separation_weight
             )
             residual_norm = residual.detach()[candidate].norm(dim=1).mean()
+            primitive_consistent = _primitive_partition_is_consistent(
+                config,
+                base_features.detach(),
+                parent_mask,
+                split.targets,
+                primitive_centers,
+                primitive_to_semantic,
+            )
             accepted = (
-                refined_score + float(config.verifier_tolerance) >= base_score
+                child_compactness - parent_compactness >= float(config.min_structure_gain)
+                and child_separation >= float(config.min_child_separation)
+                and primitive_consistent
+                and refined_score + float(config.verifier_tolerance) >= base_score
                 and residual_norm <= float(config.max_residual_norm)
             )
             if accepted:
                 accept_mask[candidate] = True
                 accepted_regions += 1
             else:
+                primitive_rejections += int(not primitive_consistent)
                 rollback_mask[candidate] = True
                 accepted_targets[candidate] = -1
                 rejected_regions += 1
 
-    return accepted_targets, accept_mask, rollback_mask, accepted_regions, rejected_regions
+    return (
+        accepted_targets,
+        accept_mask,
+        rollback_mask,
+        accepted_regions,
+        rejected_regions,
+        primitive_rejections,
+    )
 
 
 def run_stage2_feature_pipeline(
@@ -120,11 +209,17 @@ def run_stage2_feature_pipeline(
     semantic_logits,
     regions,
     batch_ids,
+    primitive_centers=None,
+    primitive_to_semantic=None,
 ):
     """Refine candidate features and commit only structurally safe splits."""
+    # Candidate objectives must not directly reshape the GrowSP backbone. The
+    # accepted structure still affects its next pseudo-label round, while this
+    # local branch optimizes only the Feature Refiner.
+    refiner_features = point_features.detach()
     split = split_superpoints(
         config.split_config(),
-        point_features.detach(),
+        refiner_features,
         coordinates,
         colors,
         semantic_logits.detach(),
@@ -132,7 +227,7 @@ def run_stage2_feature_pipeline(
         batch_ids,
     )
     proposed_features, residual = feature_refiner.refine(
-        point_features,
+        refiner_features,
         coordinates,
         batch_ids,
         split.query_indices,
@@ -140,16 +235,18 @@ def run_stage2_feature_pipeline(
         regions=split.dynamic_regions,
         residual_scale=config.residual_scale,
     )
-    targets, accept_mask, rollback_mask, accepted, rejected = _verify_feature_splits(
+    targets, accept_mask, rollback_mask, accepted, rejected, primitive_rejections = _verify_feature_splits(
         config,
-        point_features,
+        refiner_features,
         proposed_features,
         residual,
         split,
         regions,
         batch_ids,
+        primitive_centers,
+        primitive_to_semantic,
     )
-    refined_features = point_features.clone()
+    refined_features = refiner_features.clone()
     refined_features[accept_mask] = proposed_features[accept_mask]
     dynamic_regions = reindex_split_regions(regions, batch_ids, targets)
     confidence = torch.zeros_like(split.target_confidence)
@@ -158,10 +255,11 @@ def run_stage2_feature_pipeline(
         "selected_regions": split.statistics["split_candidate_regions"],
         "accepted_splits": accepted,
         "rejected_splits": rejected,
+        "primitive_rejections": primitive_rejections,
         "supervised_ratio": float(accept_mask.float().mean().item()),
     }
     return Stage2FeatureOutput(
-        base_features=point_features,
+        base_features=refiner_features,
         refined_features=refined_features,
         residual_features=residual,
         dynamic_regions=dynamic_regions,
@@ -230,6 +328,12 @@ class Stage2FeatureModule:
     def __init__(self, feature_refiner, config):
         self.feature_refiner = feature_refiner
         self.config = config
+        self.primitive_centers = None
+        self.primitive_to_semantic = None
+
+    def set_reference_primitives(self, primitive_centers, primitive_to_semantic):
+        self.primitive_centers = primitive_centers.detach()
+        self.primitive_to_semantic = primitive_to_semantic.detach()
 
     def eval(self):
         self.feature_refiner.eval()
@@ -245,4 +349,6 @@ class Stage2FeatureModule:
             semantic_logits,
             regions,
             batch_ids,
+            self.primitive_centers,
+            self.primitive_to_semantic,
         )
