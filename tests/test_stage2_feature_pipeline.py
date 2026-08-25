@@ -1,13 +1,17 @@
+from types import SimpleNamespace
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from lib.stage2_feature_pipeline import (
     Stage2FeatureConfig,
+    Stage2FeatureModule,
     run_stage2_feature_pipeline,
     stage2_feature_losses,
 )
-from lib.utils import enforce_cannot_link
+from lib.utils import get_pseudo
 from models.feature_refiner import CandidateFeatureRefiner
 
 
@@ -84,20 +88,25 @@ def test_feature_verifier_rolls_back_a_split_that_collapses_child_separation():
     assert torch.allclose(output.refined_features, output.base_features)
 
 
-def test_cannot_link_prevents_split_children_from_immediately_remerging():
-    assignments = torch.tensor([0, 0, 1, 2])
-    features = torch.tensor(
-        [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [-1.0, 0.0]]
-    )
-    sizes = torch.tensor([8, 6, 10, 12])
+def test_stage2_module_is_applied_after_grow():
+    refiner = CandidateFeatureRefiner(2, hidden_dim=8, num_heads=2)
+    module = Stage2FeatureModule(refiner, _config())
 
-    constrained, prevented = enforce_cannot_link(
-        assignments,
-        features,
-        sizes,
-        torch.tensor([[0, 1]]),
-    )
+    assert module.apply_after_grow is True
 
-    assert prevented == 1
-    assert constrained[0] != constrained[1]
-    assert torch.unique(constrained).numel() == torch.unique(assignments).numel()
+
+def test_grown_regions_are_saved_for_the_training_round(tmp_path):
+    args = SimpleNamespace(
+        pseudo_label_path=str(tmp_path),
+        stage2_split_refine_enable=True,
+    )
+    labels = torch.tensor([0, 1, 1, -1])
+    initial_regions = torch.tensor([0, 0, 1, -1])
+    grown_regions = torch.tensor([0, 0, 1])
+    final_regions = [torch.tensor([0, 1, 2])]
+    context = [('scene', labels, initial_regions, grown_regions)]
+
+    get_pseudo(args, context, np.array([2, 3, 4]), final_regions)
+
+    saved = np.load(tmp_path / 'scene_grown_region.npy')
+    assert np.array_equal(saved, np.array([0, 0, 1, -1]))

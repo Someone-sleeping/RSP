@@ -387,6 +387,7 @@ def main(args, logger):
     '''Superpoints will grow in 2nd Stage'''
     current_epoch = max(start_epoch, start_grow_epoch)
     stage2_end = start_grow_epoch + args.max_epoch[1]
+    split_refine_was_active = False
     for epoch in range(current_epoch + 1, stage2_end + 1):
         stage2_progress = (epoch - start_grow_epoch) / max(float(args.max_epoch[1]), 1.0)
         split_refine_active = (
@@ -394,7 +395,11 @@ def main(args, logger):
             and stage2_progress >= args.stage2_split_start_ratio
         )
         '''Take 10 epochs as a round'''
-        if (epoch - 1) % 10 == 0:
+        first_resumed_stage2_epoch = (
+            args.start_stage2_from_resume and epoch == current_epoch + 1
+        )
+        split_refine_activated = split_refine_active and not split_refine_was_active
+        if (epoch - 1) % 10 == 0 or first_resumed_stage2_epoch or split_refine_activated:
             classifier, primitive_to_semantic = cluster(
                 args, logger, cluster_loader, model, epoch, start_grow_epoch, is_Growing,
                 teacher_classifier=teacher_classifier,
@@ -430,6 +435,7 @@ def main(args, logger):
                 o_Acc, m_Acc, s = eval(epoch, args, test_areas)
                 logger.info('Epoch: {:02d}, oAcc {:.2f}  mAcc {:.2f} IoUs'.format(epoch, o_Acc, m_Acc) + s)
                 log_refine_eval_stats(args, logger, epoch)
+        split_refine_was_active = split_refine_active
 
     # Stage 3 starts only after GrowSP has completed progressive growing. The
     # decomposed regions participate in feature aggregation and pseudo-label
@@ -605,13 +611,12 @@ def cluster(
     if structure_stats and structure_stats['scenes'] > 0:
         coverage = structure_stats['supervised_points'] / max(structure_stats['valid_points'], 1)
         logger.info(
-            'Epoch: {}, split-aware reclustering: scenes {}, candidates {}, accepted {}, '
-            'prevented remerges {}, coverage {:.2f}%'.format(
+            'Epoch: {}, grow-then-split clustering: scenes {}, candidates {}, '
+            'accepted {}, coverage {:.2f}%'.format(
                 epoch,
                 structure_stats['scenes'],
                 structure_stats['candidate_regions'],
                 structure_stats['accepted_splits'],
-                structure_stats.get('prevented_remerges', 0),
                 100 * coverage,
             )
         )

@@ -205,6 +205,19 @@ class S3DIStrain(Dataset):
                 pseudo = -np.ones_like(labels, dtype=np.long)
             else:
                 pseudo = np.array(np.load(file_path), dtype=np.long)
+            if getattr(self.args, 'stage2_split_refine_enable', False):
+                grown_region_path = (
+                    self.args.pseudo_label_path + '/' + scene_name + '_grown_region.npy'
+                )
+                if os.path.exists(grown_region_path):
+                    grown_region = np.array(np.load(grown_region_path), dtype=np.long)
+                    if grown_region.shape != region.shape:
+                        raise ValueError(
+                            'Saved grown-region map does not match {}: {} vs {}'.format(
+                                scene_name, grown_region.shape, region.shape
+                            )
+                        )
+                    region = grown_region
 
         return coords, feats, normals, labels, inverse_map, pseudo, inds, region, index
 

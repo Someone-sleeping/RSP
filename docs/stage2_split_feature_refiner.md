@@ -10,21 +10,29 @@ and the pseudo-label supervision that updates the backbone.
 ## Training flow
 
 1. Resume the trained Stage-1 backbone and primitive classifier.
-2. Detect mixed candidate superpoints from the current semantic state, point
-   features, coordinates, and colors.
-3. Produce candidate-only feature residuals with bidirectional Query-Scene
+2. Run the original GrowSP merge to obtain the scheduled coarse superpoints for
+   the current Stage-2 round.
+3. Detect mixed candidates inside those grown superpoints from the current
+   semantic state, point features, coordinates, and colors.
+4. Produce candidate-only feature residuals with bidirectional Query-Scene
    attention and a point-wise prior branch.
-4. Accept a split only when child compactness/separation is not degraded and
+5. Accept a split only when child compactness/separation is not degraded and
    the residual magnitude remains bounded; otherwise restore the parent region
    and its original features.
-5. Keep accepted child regions distinct during the current grow operation with
-   a cannot-link constraint, while preserving GrowSP's scheduled cluster count.
-6. Regenerate primitive pseudo labels and jointly optimize the backbone and
+6. Use the verified split regions directly for primitive clustering and pseudo
+   labels; no second GrowSP merge is performed after decomposition.
+7. Jointly optimize the backbone and
    feature Refiner with primitive, split-semantic, feature-structure, and
    residual regularization losses.
 
 The Refiner output therefore affects both the current training loss and the
 next clustering round through updated backbone features.
+
+Each clustering round also stores the grown, pre-decomposition region map.
+Training batches reload this map so candidate discovery uses the same coarse
+regions that produced the current pseudo labels. Final validation reports the
+jointly optimized backbone prediction; it does not append the Refiner as an
+inference-time post-processing module.
 
 ## Start from the completed Stage 1
 
@@ -53,8 +61,9 @@ the stored `start_grow_epoch` and Refiner optimizer state are retained.
 
 ## Verification
 
-The end-to-end smoke run resumed epoch 470 and completed clustering, one joint
-training step, checkpoint save/reload, and Area-5 evaluation. Across 204 train
-scenes it found 12,608 candidate regions, accepted 2,580 splits, and prevented
-1,401 immediate sibling remerges. The smoke mIoU is not a reported accuracy
-result because only one Stage-2 batch was optimized.
+The end-to-end smoke test resumes epoch 470 and checks clustering, one joint
+training step, checkpoint save/reload, and Area-5 evaluation. All 204 training
+scenes produced pre-decomposition grown-region maps. With the smoke-only target
+of 20 grown regions per scene, the method found 2,387 candidates and accepted
+669 splits before primitive clustering. Its 39.46 Area-5 mIoU is not a reported
+accuracy result because only one Stage-2 batch is optimized.

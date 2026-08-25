@@ -49,7 +49,6 @@ class Stage2FeatureOutput:
     query_indices: torch.Tensor
     original_regions: torch.Tensor
     batch_ids: torch.Tensor
-    cannot_link_pairs: torch.Tensor
     stats: dict
 
 
@@ -153,22 +152,6 @@ def run_stage2_feature_pipeline(
     refined_features = point_features.clone()
     refined_features[accept_mask] = proposed_features[accept_mask]
     dynamic_regions = reindex_split_regions(regions, batch_ids, targets)
-    cannot_link_pairs = []
-    flat_regions = regions.view(-1).long().to(point_features.device)
-    flat_batch_ids = batch_ids.view(-1).long().to(point_features.device)
-    for batch_id in torch.unique(flat_batch_ids):
-        scene_mask = flat_batch_ids == batch_id
-        for region_id in torch.unique(flat_regions[scene_mask]):
-            parent = scene_mask & (flat_regions == region_id) & (targets >= 0)
-            child_regions = torch.unique(dynamic_regions[parent])
-            if child_regions.numel() == 2:
-                cannot_link_pairs.append(child_regions)
-    if cannot_link_pairs:
-        cannot_link_pairs = torch.stack(cannot_link_pairs).long()
-    else:
-        cannot_link_pairs = torch.empty(
-            (0, 2), dtype=torch.long, device=point_features.device
-        )
     confidence = torch.zeros_like(split.target_confidence)
     confidence[accept_mask] = split.target_confidence[accept_mask]
     stats = {
@@ -191,7 +174,6 @@ def run_stage2_feature_pipeline(
         query_indices=split.query_indices,
         original_regions=regions.view(-1).long(),
         batch_ids=batch_ids.view(-1).long(),
-        cannot_link_pairs=cannot_link_pairs,
         stats=stats,
     )
 
@@ -242,6 +224,8 @@ def stage2_feature_losses(output, semantic_centers, semantic_scale=3.0):
 
 class Stage2FeatureModule:
     """Shared adapter for Stage-2 training-time and clustering-time refinement."""
+
+    apply_after_grow = True
 
     def __init__(self, feature_refiner, config):
         self.feature_refiner = feature_refiner

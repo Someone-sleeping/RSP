@@ -9,34 +9,6 @@ import MinkowskiEngine as ME
 from tqdm import tqdm
 from .my_utils import VisualizationThreadPool
 
-
-def enforce_cannot_link(sp_index, region_features, region_sizes, cannot_link_pairs):
-    """Prevent verified split siblings from immediately merging into one cluster."""
-    if cannot_link_pairs is None or cannot_link_pairs.numel() == 0:
-        return sp_index, 0
-    sp_index = sp_index.clone()
-    features = region_features.detach().cpu().float()
-    sizes = region_sizes.detach().cpu().view(-1)
-    prevented = 0
-    for pair in cannot_link_pairs.detach().cpu().long():
-        first, second = int(pair[0].item()), int(pair[1].item())
-        if sp_index[first] != sp_index[second]:
-            continue
-        moving = first if sizes[first] <= sizes[second] else second
-        forbidden_cluster = int(sp_index[first].item())
-        alternatives = torch.unique(sp_index)
-        alternatives = alternatives[alternatives != forbidden_cluster]
-        if alternatives.numel() == 0:
-            continue
-        centers = []
-        for cluster_id in alternatives:
-            centers.append(features[sp_index == cluster_id].mean(dim=0))
-        centers = torch.stack(centers)
-        nearest = torch.argmin(torch.norm(centers - features[moving], dim=1))
-        sp_index[moving] = alternatives[nearest]
-        prevented += 1
-    return sp_index, prevented
-
 def get_sp_feature(
     args, loader, model, current_growsp, vis=False,
     learnable_sp=None, semantic_centers=None, superpoint_module=None,
@@ -45,6 +17,10 @@ def get_sp_feature(
     # the deterministic Stage-3 decomposer through the neutral module name.
     legacy_learnable_module = superpoint_module is None and learnable_sp is not None
     superpoint_module = superpoint_module or learnable_sp
+    refine_after_grow = bool(
+        superpoint_module is not None
+        and getattr(superpoint_module, 'apply_after_grow', False)
+    )
     print('computing point feats ....')
     point_feats_list = []
     point_labels_list = []
@@ -59,7 +35,6 @@ def get_sp_feature(
         'accepted_splits': 0,
         'supervised_points': 0,
         'valid_points': 0,
-        'prevented_remerges': 0,
     }
     if superpoint_module is not None:
         superpoint_module.eval()
@@ -71,7 +46,7 @@ def get_sp_feature(
             scene_name = loader.dataset.name[index[0]]
             gt = labels.clone()
             raw_region = region.clone()
-            cannot_link_pairs = None
+            grown_region_for_training = None
 
             in_field = ME.TensorField(features, coords, device=0)
 
@@ -91,7 +66,11 @@ def get_sp_feature(
             ##
             pc_rgb = features[:, 0:3]
             pc_xyz = features[:, 3:] * args.voxel_size
-            if superpoint_module is not None and semantic_centers is not None:
+            if (
+                superpoint_module is not None
+                and semantic_centers is not None
+                and not refine_after_grow
+            ):
                 semantic_logits = F.linear(F.normalize(feats, dim=1), semantic_centers)
                 if legacy_learnable_module:
                     semantic_logits = semantic_logits * getattr(args, 'learnable_sp_query_scale', 10.0)
@@ -114,7 +93,6 @@ def get_sp_feature(
                 region = structure_output.dynamic_regions.cpu()
                 if hasattr(structure_output, 'refined_features'):
                     feats = structure_output.refined_features
-                cannot_link_pairs = getattr(structure_output, 'cannot_link_pairs', None)
                 structure_stats['scenes'] += 1
                 structure_stats['candidate_regions'] += structure_output.stats['selected_regions']
                 structure_stats['accepted_splits'] += structure_output.stats['accepted_splits']
@@ -150,18 +128,33 @@ def get_sp_feature(
                 # sp_idx_bf = torch.from_numpy(KMeans(n_clusters=n_segments + 1, n_init=5, random_state=0, n_jobs=5).fit_predict(region_feats.cpu().numpy())).long()
                 # sp_idx = masked_kmeans_consensus(region_feats, n_segments, n_rounds=10, mask_prob=0.3)
                 sp_idx = torch.from_numpy(KMeans(n_clusters=n_segments, n_init=5, random_state=0, n_jobs=5).fit_predict(region_feats.cpu().numpy())).long()
-                sp_idx, prevented = enforce_cannot_link(
-                    sp_idx,
-                    region_feats,
-                    per_region_num,
-                    cannot_link_pairs,
-                )
-                structure_stats['prevented_remerges'] += prevented
             else:
                 feats = region_feats
                 sp_idx = torch.tensor(range(region_feats.size(0)))
 
             neural_region = sp_idx[region]  # 每个点的region标签 基于region的
+            if refine_after_grow and current_growsp is not None and semantic_centers is not None:
+                # Stage-2 order: first finish the scheduled GrowSP merge, then
+                # decompose only the over-merged regions. No K-means follows.
+                grown_region_for_training = neural_region.clone()
+                semantic_logits = F.linear(F.normalize(feats, dim=1), semantic_centers)
+                structure_output = superpoint_module(
+                    feats,
+                    pc_xyz,
+                    pc_rgb,
+                    semantic_logits,
+                    neural_region.to(feats.device),
+                    torch.zeros(
+                        neural_region.size(0), dtype=torch.long, device=feats.device
+                    ),
+                )
+                neural_region = structure_output.dynamic_regions.cpu()
+                feats = structure_output.refined_features
+                structure_stats['scenes'] += 1
+                structure_stats['candidate_regions'] += structure_output.stats['selected_regions']
+                structure_stats['accepted_splits'] += structure_output.stats['accepted_splits']
+                structure_stats['supervised_points'] += int(structure_output.supervision_mask.sum().item())
+                structure_stats['valid_points'] += int(neural_region.numel())
             pfh = []
 
             neural_region_num = len(torch.unique(neural_region))
@@ -226,12 +219,12 @@ def get_sp_feature(
             all_sp_index.append(neural_region)
 
             if vis:
-                context.append((scene_name, gt, raw_region, coords, inverse_map))
+                context.append((scene_name, gt, raw_region, grown_region_for_training, coords, inverse_map))
                 vis_path = '/home/magic/magic/cm/repositories/GrowSP/data/S3DIS/sp_vis'
                 vis_pool.submit_task(coords, scene_name, valid_mask, inverse_map, neural_region.numpy(), vis_path)
                 vis_pool.clean_up()
             else:
-                context.append((scene_name, gt, raw_region))
+                context.append((scene_name, gt, raw_region, grown_region_for_training))
 
             torch.cuda.empty_cache()
             torch.cuda.synchronize(torch.device("cuda"))
@@ -347,7 +340,8 @@ def get_pseudo(args, context, cluster_pred, all_sp_index=None):
     sp_gt_labels = []  # 核心：存储每个超点的真实标签（按超点顺序）
 
     for i in range(len(context)):
-        scene_name, labels, region = context[i]
+        scene_name, labels, region = context[i][:3]
+        grown_region = context[i][3] if len(context[i]) >= 4 else None
 
         sub_cluster_pred = all_sp_index[pc_no]+ region_num
         valid_mask = region != -1
@@ -387,6 +381,13 @@ def get_pseudo(args, context, cluster_pred, all_sp_index=None):
 
         pseudo_label_file = pseudo_label_folder + '/' + scene_name + '.npy'
         np.save(pseudo_label_file, pseudo)
+        if getattr(args, 'stage2_split_refine_enable', False) and grown_region is not None:
+            grown_region_full = -np.ones_like(labels.numpy()).astype(np.int32)
+            grown_region_full[valid_mask] = grown_region.cpu().numpy().astype(np.int32)
+            np.save(
+                pseudo_label_folder + '/' + scene_name + '_grown_region.npy',
+                grown_region_full,
+            )
 
         all_gt.append(labels)
         all_pseudo.append(pseudo)

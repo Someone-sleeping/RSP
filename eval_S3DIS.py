@@ -8,11 +8,9 @@ from sklearn.utils.linear_assignment_ import linear_assignment  # pip install sc
 from sklearn.cluster import KMeans
 from models.fpn import Res16FPN18
 from models.query_refiner import CandidateBasedRefiner
-from models.feature_refiner import CandidateFeatureRefiner
 from lib.error_query import build_error_queries
 from lib.split_regions import build_region_consistency_queries, build_split_region_queries, build_uncertain_region_queries
 from lib.stage3_pipeline import Stage3Config, run_stage3_pipeline
-from lib.stage2_feature_pipeline import Stage2FeatureConfig, run_stage2_feature_pipeline
 from lib.utils import get_fixclassifier
 import warnings
 import argparse
@@ -112,16 +110,6 @@ def parse_args():
     parser.add_argument('--stage3_enable', action='store_true', default=False,
                         help='evaluate the training-integrated Stage-3 checkpoint')
     parser.add_argument('--stage3_residual_scale', type=float, default=1.0)
-    parser.add_argument('--stage2_split_refine_enable', action='store_true', default=False)
-    parser.add_argument('--stage2_feature_residual_scale', type=float, default=0.1)
-    parser.add_argument('--stage2_min_region_points', type=int, default=20)
-    parser.add_argument('--stage2_min_child_points', type=int, default=8)
-    parser.add_argument('--stage2_max_regions', type=int, default=20)
-    parser.add_argument('--stage2_purity_th', type=float, default=0.92)
-    parser.add_argument('--stage2_entropy_th', type=float, default=0.25)
-    parser.add_argument('--stage2_min_split_conf', type=float, default=0.15)
-    parser.add_argument('--stage2_verifier_tolerance', type=float, default=0.02)
-    parser.add_argument('--stage2_max_residual_norm', type=float, default=5.0)
     return parser.parse_args()
 
 
@@ -256,10 +244,7 @@ def apply_point_accept_gate(args, candidate_scores, no_op_scores, apply_mask=Non
     return gated_scores, accepted
 
 
-def eval_once(
-    args, model, test_loader, classifier, primitive_classifier=None,
-    cluster_pred=None, refiner=None, feature_refiner=None, use_sp=False,
-):
+def eval_once(args, model, test_loader, classifier, primitive_classifier=None, cluster_pred=None, refiner=None, use_sp=False):
 
     all_preds, all_refined_preds, all_label = [], [], []
     stats = {
@@ -282,48 +267,7 @@ def eval_once(
 
             region = region.squeeze()
             #
-            if feature_refiner is not None:
-                base_scores = F.linear(F.normalize(feats), F.normalize(classifier.weight))
-                point_batch_ids = coords[:, 0].long().cuda()
-                point_coords = coords[:, 1:].float().cuda()
-                point_colors = features[:, :3].float().cuda()
-                feature_output = run_stage2_feature_pipeline(
-                    Stage2FeatureConfig(
-                        residual_scale=args.stage2_feature_residual_scale,
-                        min_region_points=args.stage2_min_region_points,
-                        min_child_points=args.stage2_min_child_points,
-                        max_regions_per_scene=args.stage2_max_regions,
-                        purity_threshold=args.stage2_purity_th,
-                        entropy_threshold=args.stage2_entropy_th,
-                        min_split_confidence=args.stage2_min_split_conf,
-                        verifier_tolerance=args.stage2_verifier_tolerance,
-                        max_residual_norm=args.stage2_max_residual_norm,
-                    ),
-                    feature_refiner,
-                    feats,
-                    point_coords,
-                    point_colors,
-                    base_scores,
-                    region.cuda(),
-                    point_batch_ids,
-                )
-                refined_scores = F.linear(
-                    feature_output.refined_features,
-                    F.normalize(classifier.weight),
-                )
-                base_preds = torch.argmax(base_scores, dim=1).cpu()
-                preds = torch.argmax(refined_scores, dim=1).cpu()
-                changed = preds != base_preds
-                stats["changed_points"] += int(changed.sum().item())
-                stats["trusted_points"] += int(feature_output.candidate_mask.sum().item())
-                stats["keep_points"] += int((~feature_output.candidate_mask).sum().item())
-                stats["total_points"] += int(preds.numel())
-                stats["queries"] += int(feature_output.query_indices.numel())
-                stats["split_regions"] += int(feature_output.stats["accepted_splits"])
-                stats["changed_trusted_points"] += int(
-                    (changed & feature_output.candidate_mask.cpu()).sum().item()
-                )
-            elif refiner is not None and getattr(args, 'stage3_enable', False):
+            if refiner is not None and getattr(args, 'stage3_enable', False):
                 base_scores = F.linear(F.normalize(feats), F.normalize(classifier.weight))
                 point_batch_ids = coords[:, 0].long().cuda()
                 point_coords = coords[:, 1:].float().cuda()
@@ -630,38 +574,10 @@ def eval(epoch, args, test_areas = ['Area_5']):
         else:
             print('Refiner checkpoint not found; evaluating without refinement.')
 
-    feature_refiner = None
-    if getattr(args, 'stage2_split_refine_enable', False):
-        feature_path = os.path.join(
-            args.save_path, 'feature_refiner_' + str(epoch) + '_checkpoint.pth'
-        )
-        if not os.path.exists(feature_path):
-            feature_path = os.path.join(
-                args.save_path, 'ckpts', 'feature_refiner_' + str(epoch) + '_checkpoint.pth'
-            )
-        if os.path.exists(feature_path):
-            feature_refiner = CandidateFeatureRefiner(
-                feat_dim=args.feats_dim,
-                hidden_dim=getattr(args, 'refine_hidden_dim', 128),
-                num_heads=getattr(args, 'refine_num_heads', 4),
-                dropout=getattr(args, 'refine_dropout', 0.0),
-            ).cuda()
-            feature_refiner.load_state_dict(
-                torch.load(feature_path, map_location='cpu'), strict=False
-            )
-            feature_refiner.eval()
-            print('Loaded feature refiner from {}'.format(feature_path))
-        else:
-            print('Feature refiner checkpoint not found; evaluating backbone only.')
-
     test_dataset = S3DIStest(args, areas=test_areas)
     test_loader = DataLoader(test_dataset, batch_size=1, collate_fn=cfl_collate_fn_test(), num_workers=4, pin_memory=True)
 
-    preds, refined_preds, labels, refine_stats = eval_once(
-        args, model, test_loader, classifier, primitive_classifier=cls,
-        cluster_pred=cluster_pred, refiner=refiner,
-        feature_refiner=feature_refiner,
-    )
+    preds, refined_preds, labels, refine_stats = eval_once(args, model, test_loader, classifier, primitive_classifier=cls, cluster_pred=cluster_pred, refiner=refiner)
     all_preds = torch.cat(preds).numpy()
     all_refined_preds = torch.cat(refined_preds).numpy()
     all_labels = torch.cat(labels).numpy()
@@ -690,8 +606,6 @@ def eval(epoch, args, test_areas = ['Area_5']):
     })
     args.eval_refine_stats = refine_stats
 
-    if getattr(args, 'stage2_split_refine_enable', False) and feature_refiner is not None:
-        return refined_o_Acc, refined_m_Acc, refined_s
     if getattr(args, 'stage3_enable', False) and refiner is not None:
         return refined_o_Acc, refined_m_Acc, refined_s
     return o_Acc, m_Acc, s
@@ -706,7 +620,7 @@ if __name__ == '__main__':
     o_Acc, m_Acc, s = eval(epoch, args, parse_test_areas(args.test_area))
     print('Epoch: {}, oAcc {:.2f}  mAcc {:.2f} IoUs'.format(epoch, o_Acc, m_Acc), s)
     stats = getattr(args, 'eval_refine_stats', None)
-    if stats and (args.refine_enable or args.stage3_enable or args.stage2_split_refine_enable):
+    if stats and (args.refine_enable or args.stage3_enable):
         print(
             'Epoch: {}, Refined oAcc {:.2f}  mAcc {:.2f}  delta_mIoU {:+.2f}  '
             'changed {:.2f}% trusted {:.2f}% keep {:.2f}% changed@trusted {:.2f}% queries {} split_regions {} consistency_regions {}'.format(
