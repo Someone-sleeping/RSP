@@ -32,8 +32,16 @@ def get_sp_feature(
     structure_stats = {
         'scenes': 0,
         'candidate_regions': 0,
+        'proposed_splits': 0,
         'accepted_splits': 0,
+        'rejected_splits': 0,
+        'refinement_accepted_splits': 0,
+        'refinement_rejected_splits': 0,
+        'refinement_score_rejections': 0,
+        'residual_norm_rejections': 0,
+        'primitive_rejections': 0,
         'supervised_points': 0,
+        'refined_points': 0,
         'valid_points': 0,
     }
     if superpoint_module is not None:
@@ -96,8 +104,26 @@ def get_sp_feature(
                     feats = structure_output.refined_features
                 structure_stats['scenes'] += 1
                 structure_stats['candidate_regions'] += structure_output.stats['selected_regions']
+                structure_stats['proposed_splits'] += structure_output.stats.get('proposed_splits', 0)
                 structure_stats['accepted_splits'] += structure_output.stats['accepted_splits']
+                structure_stats['rejected_splits'] += structure_output.stats.get('rejected_splits', 0)
+                structure_stats['refinement_accepted_splits'] += structure_output.stats.get(
+                    'refinement_accepted_splits', 0
+                )
+                structure_stats['refinement_rejected_splits'] += structure_output.stats.get(
+                    'refinement_rejected_splits', 0
+                )
+                structure_stats['refinement_score_rejections'] += structure_output.stats.get(
+                    'refinement_score_rejections', 0
+                )
+                structure_stats['residual_norm_rejections'] += structure_output.stats.get(
+                    'residual_norm_rejections', 0
+                )
+                structure_stats['primitive_rejections'] += structure_output.stats.get(
+                    'primitive_rejections', 0
+                )
                 structure_stats['supervised_points'] += int(structure_output.supervision_mask.sum().item())
+                structure_stats['refined_points'] += int(structure_output.accept_mask.sum().item())
                 structure_stats['valid_points'] += int(region.numel())
             ##
             region_num = len(torch.unique(region))
@@ -155,12 +181,30 @@ def get_sp_feature(
                 split_override_data = {
                     'dynamic_regions': structure_output.dynamic_regions.cpu(),
                     'refined_features': structure_output.refined_features.cpu(),
-                    'accept_mask': structure_output.accept_mask.cpu(),
+                    'accept_mask': structure_output.decomposition_mask.cpu(),
                 }
                 structure_stats['scenes'] += 1
                 structure_stats['candidate_regions'] += structure_output.stats['selected_regions']
+                structure_stats['proposed_splits'] += structure_output.stats.get('proposed_splits', 0)
                 structure_stats['accepted_splits'] += structure_output.stats['accepted_splits']
+                structure_stats['rejected_splits'] += structure_output.stats.get('rejected_splits', 0)
+                structure_stats['refinement_accepted_splits'] += structure_output.stats.get(
+                    'refinement_accepted_splits', 0
+                )
+                structure_stats['refinement_rejected_splits'] += structure_output.stats.get(
+                    'refinement_rejected_splits', 0
+                )
+                structure_stats['refinement_score_rejections'] += structure_output.stats.get(
+                    'refinement_score_rejections', 0
+                )
+                structure_stats['residual_norm_rejections'] += structure_output.stats.get(
+                    'residual_norm_rejections', 0
+                )
+                structure_stats['primitive_rejections'] += structure_output.stats.get(
+                    'primitive_rejections', 0
+                )
                 structure_stats['supervised_points'] += int(structure_output.supervision_mask.sum().item())
+                structure_stats['refined_points'] += int(structure_output.accept_mask.sum().item())
                 structure_stats['valid_points'] += int(neural_region.numel())
             pfh = []
 

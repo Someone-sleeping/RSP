@@ -92,16 +92,19 @@ class CandidateBasedRefiner(nn.Module):
         use_region_branch=False,
         return_components=False,
         candidate_mask=None,
+        pool_query_regions=False,
     ):
         point_coords = point_coords.float()
         if point_coords.size(1) > 3:
             point_coords = point_coords[:, :3]
 
+        batch_ids = batch_ids.long().to(point_feats.device)
+        if regions is not None:
+            regions = regions.long().to(point_feats.device).view(-1)
+
         point_delta = self.point_mlp(point_feats)
         region_delta = point_delta.new_zeros(point_delta.shape)
         if use_region_branch and regions is not None:
-            batch_ids = batch_ids.long().to(point_feats.device)
-            regions = regions.long().to(point_feats.device).view(-1)
             for batch_id in torch.unique(batch_ids):
                 scene_mask = batch_ids == batch_id
                 for region_id in torch.unique(regions[scene_mask]):
@@ -125,8 +128,6 @@ class CandidateBasedRefiner(nn.Module):
                 }
             return point_delta + region_delta
 
-        batch_ids = batch_ids.long()
-
         for batch_id in torch.unique(batch_ids):
             scene_mask = batch_ids == batch_id
             scene_indices = torch.nonzero(scene_mask, as_tuple=False).flatten()
@@ -136,8 +137,19 @@ class CandidateBasedRefiner(nn.Module):
 
             scene_feats = point_feats[scene_indices]
             scene_coords = point_coords[scene_indices]
-            query_feats = point_feats[scene_query_indices]
-            query_coords = point_coords[scene_query_indices]
+            if pool_query_regions and regions is not None:
+                query_feats = []
+                query_coords = []
+                for query_index in scene_query_indices:
+                    query_region = regions[query_index]
+                    query_mask = scene_mask & (regions == query_region)
+                    query_feats.append(point_feats[query_mask].mean(dim=0))
+                    query_coords.append(point_coords[query_mask].mean(dim=0))
+                query_feats = torch.stack(query_feats, dim=0)
+                query_coords = torch.stack(query_coords, dim=0)
+            else:
+                query_feats = point_feats[scene_query_indices]
+                query_coords = point_coords[scene_query_indices]
 
             coord_min = scene_coords.min(dim=0, keepdim=True)[0]
             coord_max = scene_coords.max(dim=0, keepdim=True)[0]

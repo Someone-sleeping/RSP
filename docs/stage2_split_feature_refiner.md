@@ -1,6 +1,6 @@
 # Stage-2 Split-Aware Feature Refiner
 
-Branch: `exp/stage2-split-feature-refiner`
+Branch: `feat/stage2-query-context-feature-refiner`
 
 This experiment inserts structure correction into GrowSP Stage 2. It is not a
 post-processing step: verified superpoint structure and refined point features
@@ -14,30 +14,47 @@ and the pseudo-label supervision that updates the backbone.
    the current Stage-2 round.
 3. Detect mixed candidates inside those grown superpoints from the current
    semantic state, point features, coordinates, and colors.
-4. Produce candidate-only feature residuals with bidirectional Query-Scene
-   attention and a point-wise prior branch.
-5. Accept a split only when it improves child compactness over the unsplit
-   parent, maps the children to distinct and semantically compatible GrowSP
-   primitives, preserves child separation after refinement, and keeps the
-   residual magnitude bounded; otherwise restore the parent region and features.
-6. Fit global primitives on the merged parent regions, then assign verified
+4. Pool each proposed child into a query token. The Candidate-based Refiner
+   reads detached non-candidate scene context and writes a feature residual only
+   to candidate points. Candidate features retain their backbone gradient.
+5. The decomposition gate accepts a split from feature compactness, sibling
+   separation, and Top-K semantic-group primitive support. A separate residual
+   gate accepts the refined feature only when it preserves the verified
+   structure and keeps the residual bounded. A rejected residual therefore does
+   not discard an otherwise reliable decomposition.
+6. Train the backbone and Refiner jointly on accepted decomposition cores using
+   child semantic, semantic-group primitive, sibling-structure, and residual
+   objectives. Query discovery and both verifier decisions are stop-gradient.
+7. Fit global primitives on the merged parent regions, then assign verified
    children to those primitives as local pseudo-label overrides. This preserves
    GrowSP's global clustering state while allowing local supervision to change.
-7. Preserve the original GrowSP primitive gradient for the backbone. The
-   detached local branch optimizes the Feature Refiner with primitive-improvement,
-   split-semantic, feature-structure, and residual losses. Verified structures
-   still update the backbone indirectly through the next pseudo-label round.
 
-The Refiner output therefore affects its detached local objective immediately
-and can affect the backbone only through verified primitive overrides in a
-later pseudo-label round.
+The Refiner is thus a training-integrated feature adapter after the backbone and
+before region aggregation. It is not applied to final predictions at inference.
 
-## Paired validation
+## Archived conservative baseline
 
 Both runs resume `baseline/ckpts/model_1070_resume.pth`, use seed 2022 and
 single-process loading, and stop at epoch 1080. The control reaches 42.93 Area-5
 mIoU; the RNG-isolated conservative Stage-2 path reaches 43.26 (+0.33). An
 independent reload of the saved epoch-1080 checkpoint reproduces 43.26.
+
+That detached implementation is preserved at
+`archive/stage2-conservative-feature-refiner-45p24`. Results for the joint
+feature-adaptation branch must be reported separately.
+
+## Joint feature-adaptation validation
+
+The calibrated branch resumes the same epoch-1070 checkpoint and runs
+continuously to epoch 1080. It accepts 114 decompositions (0.355% point
+coverage), applies 53 local primitive overrides (0.064%), and reaches 43.28
+Area-5 mIoU. Reloading the saved checkpoint independently reproduces 43.28.
+The matched GrowSP control is 42.93 and the detached conservative branch is
+43.26. Increasing `stage2_backbone_gradient_scale` from 0.1 to 0.2 reduces the
+result to 42.79, so 0.1 remains the conservative default.
+
+These ten-epoch diagnostics validate the training data flow and short-range
+stability. They do not replace the full Stage-2 result or multi-seed reporting.
 
 Each clustering round also stores the grown, pre-decomposition region map.
 Training batches reload this map so candidate discovery uses the same coarse
@@ -59,15 +76,18 @@ python train_S3DIS.py \
   --max_iter 10000 30000 \
   --stage2_feature_refiner_lr 1e-4 \
   --stage2_feature_residual_scale 0.1 \
+  --stage2_backbone_gradient_scale 0.1 \
   --stage2_split_lambda 0.2 \
   --stage2_feature_lambda 0.1 \
   --stage2_residual_lambda 0.01 \
-  --stage2_refiner_primitive_lambda 0.5 \
+  --stage2_refiner_primitive_lambda 0.05 \
   --stage2_min_split_conf 0.35 \
   --stage2_min_structure_gain 0.01 \
   --stage2_min_child_separation 0.05 \
   --stage2_min_primitive_gain 0.005 \
   --stage2_min_primitive_margin 0.01 \
+  --stage2_primitive_top_k 3 \
+  --stage2_primitive_support_tolerance 0.01 \
   --stage2_override_min_gain 0.05 \
   --stage2_override_min_margin 0.02 \
   --stage2_max_residual_norm 1.0 \

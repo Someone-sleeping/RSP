@@ -272,6 +272,8 @@ def load_resume_checkpoint(
         return 0, 0, False  # start_epoch, start_grow_epoch, is_Growing
 
     checkpoint = torch.load(args.resume, map_location='cpu')
+    args.resume_has_feature_refiner = 'feature_refiner_state_dict' in checkpoint
+    args.resume_training_stage = checkpoint.get('training_stage', '')
     model.load_state_dict(checkpoint['model_state_dict'])
     if refiner is not None:
         if 'refiner_state_dict' in checkpoint:

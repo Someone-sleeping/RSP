@@ -11,6 +11,7 @@ from lib.stage2_feature_pipeline import (
     run_stage2_feature_pipeline,
     stage2_feature_losses,
 )
+from lib.my_utils import load_resume_checkpoint
 from lib.utils import build_split_primitive_overrides, get_pseudo
 from models.feature_refiner import CandidateFeatureRefiner
 
@@ -57,11 +58,13 @@ def test_feature_refiner_updates_features_and_preserves_split_structure():
     assert output.stats['accepted_splits'] == 1
     assert torch.unique(output.dynamic_regions).numel() == 2
     assert output.supervision_mask.all()
-    assert inputs[0].grad is None
+    assert output.accept_mask.all()
+    assert inputs[0].grad is not None
+    assert inputs[0].grad.abs().sum() > 0
     assert refiner.out_proj.weight.grad is not None
 
 
-def test_feature_refiner_proxy_losses_do_not_update_backbone_features():
+def test_feature_refiner_proxy_losses_update_candidate_backbone_features():
     inputs = _mixed_region()
     refiner = CandidateFeatureRefiner(2, hidden_dim=8, num_heads=2)
     output = run_stage2_feature_pipeline(_config(), refiner, *inputs)
@@ -69,8 +72,37 @@ def test_feature_refiner_proxy_losses_do_not_update_backbone_features():
 
     (losses['semantic'] + losses['structure'] + losses['residual']).backward()
 
-    assert inputs[0].grad is None
+    assert inputs[0].grad is not None
+    assert inputs[0].grad.abs().sum() > 0
     assert refiner.point_mlp[-1].weight.grad is not None
+
+
+def test_feature_refiner_reads_but_does_not_backpropagate_to_non_candidates():
+    torch.manual_seed(0)
+    features = torch.randn(6, 4, requires_grad=True)
+    coordinates = torch.randn(6, 3)
+    batch_ids = torch.zeros(6, dtype=torch.long)
+    regions = torch.tensor([0, 0, 1, 1, 2, 2])
+    candidate_mask = torch.tensor([True, True, False, False, False, False])
+    refiner = CandidateFeatureRefiner(4, hidden_dim=8, num_heads=2)
+    with torch.no_grad():
+        refiner.out_proj.weight.fill_(0.1)
+        refiner.point_mlp[-1].weight.fill_(0.1)
+
+    proposed, _ = refiner.refine(
+        features,
+        coordinates,
+        batch_ids,
+        torch.tensor([0]),
+        candidate_mask,
+        regions=regions,
+    )
+    proposed[candidate_mask].sum().backward()
+
+    assert features.grad[candidate_mask].abs().sum() > 0
+    assert torch.equal(
+        features.grad[~candidate_mask], torch.zeros_like(features.grad[~candidate_mask])
+    )
 
 
 class CollapsingFeatureRefiner(nn.Module):
@@ -83,21 +115,56 @@ class CollapsingFeatureRefiner(nn.Module):
         candidate_mask,
         regions=None,
         residual_scale=0.1,
+        backbone_gradient_scale=0.1,
     ):
         proposed = F.normalize(torch.ones_like(point_features), dim=1)
         return proposed, proposed - point_features
 
 
-def test_feature_verifier_rolls_back_a_split_that_collapses_child_separation():
+class DirectionPreservingLargeRawResidual(nn.Module):
+    def refine(
+        self,
+        point_features,
+        coordinates,
+        batch_ids,
+        query_indices,
+        candidate_mask,
+        regions=None,
+        residual_scale=0.1,
+        backbone_gradient_scale=0.1,
+    ):
+        residual = 2.0 * point_features
+        proposed = F.normalize(
+            point_features + float(residual_scale) * residual, dim=1
+        )
+        return proposed, residual
+
+
+def test_feature_verifier_keeps_split_but_rolls_back_collapsing_residual():
     output = run_stage2_feature_pipeline(
         _config(), CollapsingFeatureRefiner(), *_mixed_region()
     )
 
-    assert output.stats['accepted_splits'] == 0
-    assert output.stats['rejected_splits'] == 1
-    assert output.rollback_mask.all()
-    assert torch.unique(output.dynamic_regions).numel() == 1
+    assert output.stats['accepted_splits'] == 1
+    assert output.stats['refinement_accepted_splits'] == 0
+    assert output.stats['refinement_rejected_splits'] == 1
+    assert output.decomposition_mask.all()
+    assert output.refinement_rollback_mask.all()
+    assert not output.rollback_mask.any()
+    assert torch.unique(output.dynamic_regions).numel() == 2
     assert torch.allclose(output.refined_features, output.base_features)
+
+
+def test_feature_verifier_bounds_the_applied_not_raw_residual():
+    config = _config()
+    config.max_residual_norm = 0.5
+    output = run_stage2_feature_pipeline(
+        config, DirectionPreservingLargeRawResidual(), *_mixed_region()
+    )
+
+    assert output.stats['accepted_splits'] == 1
+    assert output.stats['refinement_accepted_splits'] == 1
+    assert output.stats['residual_norm_rejections'] == 0
 
 
 def test_feature_verifier_rejects_semantic_split_without_feature_separation():
@@ -130,11 +197,49 @@ def test_feature_verifier_rejects_children_inconsistent_with_global_primitives()
     assert output.rollback_mask.all()
 
 
+def test_feature_verifier_uses_soft_topk_primitive_group_support():
+    inputs = _mixed_region()
+    refiner = CandidateFeatureRefiner(2, hidden_dim=8, num_heads=2)
+    primitive_centers = torch.tensor(
+        [[1.0, 0.0], [0.999, 0.04], [0.995, 0.10], [0.0, 1.0]]
+    )
+    primitive_to_semantic = torch.tensor([1, 0, 0, 1])
+
+    output = run_stage2_feature_pipeline(
+        _config(), refiner, *inputs, primitive_centers, primitive_to_semantic
+    )
+
+    assert output.stats['accepted_splits'] == 1
+    assert output.stats['primitive_rejections'] == 0
+
+
 def test_stage2_module_is_applied_after_grow():
     refiner = CandidateFeatureRefiner(2, hidden_dim=8, num_heads=2)
     module = Stage2FeatureModule(refiner, _config())
 
     assert module.apply_after_grow is True
+
+
+def test_resume_checkpoint_restores_stage2_refiner_activation_state(tmp_path):
+    model = nn.Linear(2, 2)
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'epoch': 1075,
+        'is_Growing': True,
+        'start_grow_epoch': 470,
+        'training_stage': 'stage2_split_feature_refiner',
+        'feature_refiner_state_dict': {},
+    }
+    path = tmp_path / 'resume.pth'
+    torch.save(checkpoint, path)
+    args = SimpleNamespace(resume=str(path))
+    logger = SimpleNamespace(info=lambda *_: None)
+
+    state = load_resume_checkpoint(args, model, None, None, logger)
+
+    assert state == (1075, 470, True)
+    assert args.resume_has_feature_refiner is True
+    assert args.resume_training_stage == 'stage2_split_feature_refiner'
 
 
 def test_grown_regions_are_saved_for_the_training_round(tmp_path):

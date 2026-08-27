@@ -165,10 +165,11 @@ def parse_args():
                         help='fraction of Stage 2 completed before split-aware refinement starts')
     parser.add_argument('--stage2_feature_refiner_lr', type=float, default=1e-4)
     parser.add_argument('--stage2_feature_residual_scale', type=float, default=0.1)
+    parser.add_argument('--stage2_backbone_gradient_scale', type=float, default=0.1)
     parser.add_argument('--stage2_split_lambda', type=float, default=0.2)
     parser.add_argument('--stage2_feature_lambda', type=float, default=0.1)
     parser.add_argument('--stage2_residual_lambda', type=float, default=0.01)
-    parser.add_argument('--stage2_refiner_primitive_lambda', type=float, default=0.5)
+    parser.add_argument('--stage2_refiner_primitive_lambda', type=float, default=0.05)
     parser.add_argument('--stage2_min_region_points', type=int, default=20)
     parser.add_argument('--stage2_min_child_points', type=int, default=8)
     parser.add_argument('--stage2_max_regions', type=int, default=20)
@@ -181,6 +182,8 @@ def parse_args():
     parser.add_argument('--stage2_min_child_separation', type=float, default=0.05)
     parser.add_argument('--stage2_min_primitive_gain', type=float, default=0.005)
     parser.add_argument('--stage2_min_primitive_margin', type=float, default=0.01)
+    parser.add_argument('--stage2_primitive_top_k', type=int, default=3)
+    parser.add_argument('--stage2_primitive_support_tolerance', type=float, default=0.01)
     parser.add_argument('--stage2_override_min_gain', type=float, default=0.05)
     parser.add_argument('--stage2_override_min_margin', type=float, default=0.02)
     parser.add_argument('--stage2_max_steps', type=int, default=-1,
@@ -284,6 +287,7 @@ def main(args, logger):
         torch.cuda.set_rng_state_all(cuda_rng_state)
         stage2_feature_config = Stage2FeatureConfig(
             residual_scale=args.stage2_feature_residual_scale,
+            backbone_gradient_scale=args.stage2_backbone_gradient_scale,
             min_region_points=args.stage2_min_region_points,
             min_child_points=args.stage2_min_child_points,
             max_regions_per_scene=args.stage2_max_regions,
@@ -296,6 +300,8 @@ def main(args, logger):
             min_child_separation=args.stage2_min_child_separation,
             min_primitive_gain=args.stage2_min_primitive_gain,
             min_primitive_margin=args.stage2_min_primitive_margin,
+            primitive_top_k=args.stage2_primitive_top_k,
+            primitive_support_tolerance=args.stage2_primitive_support_tolerance,
         )
         stage2_feature_module = Stage2FeatureModule(feature_refiner, stage2_feature_config)
         logger.info(feature_refiner)
@@ -414,7 +420,11 @@ def main(args, logger):
     stage2_loop_end = stage2_end
     if args.stage2_stop_epoch > 0:
         stage2_loop_end = min(stage2_loop_end, args.stage2_stop_epoch)
-    split_refine_was_active = False
+    split_refine_was_active = bool(
+        args.stage2_split_refine_enable
+        and getattr(args, 'resume_has_feature_refiner', False)
+        and getattr(args, 'resume_training_stage', '') == 'stage2_split_feature_refiner'
+    )
     for epoch in range(current_epoch + 1, stage2_loop_end + 1):
         stage2_progress = (epoch - start_grow_epoch) / max(float(args.max_epoch[1]), 1.0)
         split_refine_active = (
@@ -648,14 +658,24 @@ def cluster(
     structure_stats = getattr(args, 'cluster_superpoint_stats', None)
     if structure_stats and structure_stats['scenes'] > 0:
         coverage = structure_stats['supervised_points'] / max(structure_stats['valid_points'], 1)
+        refined_coverage = structure_stats['refined_points'] / max(structure_stats['valid_points'], 1)
         logger.info(
-            'Epoch: {}, grow-then-split clustering: scenes {}, candidates {}, '
-            'accepted {}, coverage {:.2f}%'.format(
+            'Epoch: {}, grow-then-split clustering: scenes {}, candidates {}, proposals {}, '
+            'decomposition accepted {}, rejected {} (primitive {}), coverage {:.3f}%, '
+            'refinement accepted {}, rejected {} (score {}, norm {}), refined coverage {:.3f}%'.format(
                 epoch,
                 structure_stats['scenes'],
                 structure_stats['candidate_regions'],
+                structure_stats['proposed_splits'],
                 structure_stats['accepted_splits'],
-                100 * coverage,
+                structure_stats['rejected_splits'],
+                structure_stats['primitive_rejections'],
+                100.0 * coverage,
+                structure_stats['refinement_accepted_splits'],
+                structure_stats['refinement_rejected_splits'],
+                structure_stats['refinement_score_rejections'],
+                structure_stats['residual_norm_rejections'],
+                100.0 * refined_coverage,
             )
         )
     sp_feats = torch.cat(feats, dim=0)### will do Kmeans with geometric distance
@@ -1044,10 +1064,13 @@ def train_stage2_split_refiner(
     running = {
         'total': 0.0,
         'primitive': 0.0,
-        'refiner_primitive_delta': 0.0,
+        'refiner_primitive': 0.0,
         'split': 0.0,
         'feature': 0.0,
         'accepted': 0,
+        'refined': 0,
+        'refine_score_rejected': 0,
+        'refine_norm_rejected': 0,
         'candidates': 0,
         'steps': 0,
     }
@@ -1080,24 +1103,19 @@ def train_stage2_split_refiner(
             primitive_to_semantic,
         )
         base_logits = F.linear(point_features, F.normalize(classifier.weight))
-        refined_logits = F.linear(
-            output.refined_features, F.normalize(classifier.weight)
-        )
         base_primitive_loss = F.cross_entropy(
             base_logits * 3, pseudo_labels, ignore_index=-1
         )
-        refined_primitive_loss = F.cross_entropy(
-            refined_logits * 3, pseudo_labels, ignore_index=-1
-        )
-        # Preserve the original GrowSP gradient on the backbone. The detached
-        # Refiner branch learns to improve primitive support without injecting
-        # its noisier 12-class proxy gradients directly into point features.
         primitive_loss = base_primitive_loss
-        refiner_primitive_delta = refined_primitive_loss - base_primitive_loss.detach()
-        feature_losses = stage2_feature_losses(output, semantic_centers)
+        feature_losses = stage2_feature_losses(
+            output,
+            semantic_centers,
+            classifier.weight,
+            primitive_to_semantic,
+        )
         total_loss = (
             primitive_loss
-            + args.stage2_refiner_primitive_lambda * refiner_primitive_delta
+            + args.stage2_refiner_primitive_lambda * feature_losses['primitive']
             + args.stage2_split_lambda * feature_losses['semantic']
             + args.stage2_feature_lambda * feature_losses['structure']
             + args.stage2_residual_lambda * feature_losses['residual']
@@ -1112,10 +1130,13 @@ def train_stage2_split_refiner(
 
         running['total'] += float(total_loss.detach().item())
         running['primitive'] += float(primitive_loss.detach().item())
-        running['refiner_primitive_delta'] += float(refiner_primitive_delta.detach().item())
+        running['refiner_primitive'] += float(feature_losses['primitive'].detach().item())
         running['split'] += float(feature_losses['semantic'].detach().item())
         running['feature'] += float(feature_losses['structure'].detach().item())
-        running['accepted'] += int(output.accept_mask.sum().item())
+        running['accepted'] += int(output.decomposition_mask.sum().item())
+        running['refined'] += int(output.accept_mask.sum().item())
+        running['refine_score_rejected'] += int(output.stats['refinement_score_rejections'])
+        running['refine_norm_rejected'] += int(output.stats['residual_norm_rejections'])
         running['candidates'] += int(output.candidate_mask.sum().item())
         running['steps'] += 1
 
@@ -1124,20 +1145,31 @@ def train_stage2_split_refiner(
             candidates = max(running['candidates'], 1)
             logger.info(
                 'Stage 2 Split-Refine Epoch {:02d} [{}/{}] loss {:.4f} '
-                'primitive {:.4f} refiner_delta {:+.4f} split {:.4f} feature {:.4f} accepted {:.2f}%'.format(
+                'primitive {:.4f} refiner_primitive {:.4f} split {:.4f} feature {:.4f} '
+                'decomposition {:.2f}% refinement {:.2f}% rejected(score/norm) {}/{}'.format(
                     epoch,
                     batch_idx + 1,
                     len(train_loader),
                     running['total'] / steps,
                     running['primitive'] / steps,
-                    running['refiner_primitive_delta'] / steps,
+                    running['refiner_primitive'] / steps,
                     running['split'] / steps,
                     running['feature'] / steps,
                     100.0 * running['accepted'] / candidates,
+                    100.0 * running['refined'] / candidates,
+                    running['refine_score_rejected'],
+                    running['refine_norm_rejected'],
                 )
             )
             for key in running:
-                running[key] = 0.0 if key not in ('accepted', 'candidates', 'steps') else 0
+                running[key] = (
+                    0.0
+                    if key not in (
+                        'accepted', 'refined', 'refine_score_rejected',
+                        'refine_norm_rejected', 'candidates', 'steps',
+                    )
+                    else 0
+                )
 
 
 def train_stage3(
