@@ -3,18 +3,25 @@ import torch.nn.functional as F
 from datasets.S3DIS import S3DIStest, cfl_collate_fn_test
 import numpy as np
 import MinkowskiEngine as ME
+import open3d as o3d
 from torch.utils.data import DataLoader
 from sklearn.utils.linear_assignment_ import linear_assignment  # pip install scikit-learn==0.22.2
 from sklearn.cluster import KMeans
 from models.fpn import Res16FPN18
+from models.res16unet import Res16UNet14
 from models.query_refiner import CandidateBasedRefiner
-from models.unified_feature_model import extract_backbone_state_dict
+from models.unified_feature_model import (
+    UnifiedBackboneFeatureModel,
+    extract_backbone_state_dict,
+)
 from lib.error_query import build_error_queries
 from lib.split_regions import build_region_consistency_queries, build_split_region_queries, build_uncertain_region_queries
 from lib.stage3_pipeline import Stage3Config, run_stage3_pipeline
+from lib.stage2_feature_pipeline import Stage2FeatureConfig, run_stage2_feature_pipeline
 from lib.utils import get_fixclassifier
 import warnings
 import argparse
+import json
 import os
 warnings.filterwarnings('ignore')
 
@@ -44,6 +51,10 @@ def parse_args():
     parser.add_argument('--semantic_class', type=int, default=12, help='ground truth semantic class')
     parser.add_argument('--feats_dim', type=int, default=128, help='output feature dimension')
     parser.add_argument('--ignore_label', type=int, default=12, help='invalid label')
+    parser.add_argument('--model', type=str, default='res16fpn18',
+                        choices=['res16fpn18', 'res16unet14'])
+    parser.add_argument('--drop_threshold', type=int, default=10,
+                        help='ignore initial superpoints smaller than this size')
     parser.add_argument('--refine_enable', action='store_true', default=False, help='Enable error-query semantic refinement')
     parser.add_argument('--refine_hidden_dim', type=int, default=128, help='hidden dimension for query refinement')
     parser.add_argument('--refine_num_heads', type=int, default=4, help='attention heads for query refinement')
@@ -111,6 +122,33 @@ def parse_args():
     parser.add_argument('--stage3_enable', action='store_true', default=False,
                         help='evaluate the training-integrated Stage-3 checkpoint')
     parser.add_argument('--stage3_residual_scale', type=float, default=1.0)
+    parser.add_argument('--stage2_split_refine_enable', action='store_true', default=False,
+                        help='evaluate the integrated backbone-feature-context checkpoint')
+    parser.add_argument('--stage2_feature_residual_scale', type=float, default=0.1)
+    parser.add_argument('--stage2_backbone_gradient_scale', type=float, default=0.1)
+    parser.add_argument('--stage2_min_region_points', type=int, default=20)
+    parser.add_argument('--stage2_min_child_points', type=int, default=8)
+    parser.add_argument('--stage2_max_regions', type=int, default=20)
+    parser.add_argument('--stage2_purity_th', type=float, default=0.92)
+    parser.add_argument('--stage2_entropy_th', type=float, default=0.25)
+    parser.add_argument('--stage2_min_split_conf', type=float, default=0.35)
+    parser.add_argument('--stage2_verifier_tolerance', type=float, default=0.0)
+    parser.add_argument('--stage2_max_residual_norm', type=float, default=1.0)
+    parser.add_argument('--stage2_min_structure_gain', type=float, default=0.01)
+    parser.add_argument('--stage2_min_child_separation', type=float, default=0.05)
+    parser.add_argument('--stage2_min_primitive_gain', type=float, default=0.005)
+    parser.add_argument('--stage2_min_primitive_margin', type=float, default=0.01)
+    parser.add_argument('--stage2_primitive_top_k', type=int, default=3)
+    parser.add_argument('--stage2_primitive_support_tolerance', type=float, default=0.01)
+    parser.add_argument('--growsp_start', type=int, default=80)
+    parser.add_argument('--growsp_end', type=int, default=20)
+    parser.add_argument('--max_epoch', type=int, nargs=2, default=[500, 800])
+    parser.add_argument('--w_rgb', type=float, default=1.0)
+    parser.add_argument('--w_xyz', type=float, default=0.2)
+    parser.add_argument('--w_norm', type=float, default=0.8)
+    parser.add_argument('--stage2_eval_grow_regions', action='store_true', default=True,
+                        help='reproduce GrowSP region merging before candidate discovery')
+    parser.add_argument('--no_stage2_eval_grow_regions', dest='stage2_eval_grow_regions', action='store_false')
     return parser.parse_args()
 
 
@@ -119,6 +157,148 @@ def parse_test_areas(test_area):
     if not areas:
         raise ValueError('test_area must contain at least one S3DIS area')
     return areas
+
+
+_STAGE2_EVAL_CONFIG_KEYS = (
+    'input_dim', 'primitive_num', 'semantic_class', 'feats_dim',
+    'conv1_kernel_size', 'voxel_size',
+    'refine_hidden_dim', 'refine_num_heads', 'refine_dropout',
+    'stage2_feature_residual_scale', 'stage2_backbone_gradient_scale',
+    'stage2_min_region_points', 'stage2_min_child_points', 'stage2_max_regions',
+    'stage2_purity_th', 'stage2_entropy_th', 'stage2_min_split_conf',
+    'stage2_verifier_tolerance', 'stage2_max_residual_norm',
+    'stage2_min_structure_gain', 'stage2_min_child_separation',
+    'stage2_min_primitive_gain', 'stage2_min_primitive_margin',
+    'stage2_primitive_top_k', 'stage2_primitive_support_tolerance',
+    'growsp_start', 'growsp_end', 'max_epoch', 'w_rgb', 'w_xyz', 'w_norm',
+    'model', 'drop_threshold', 'fixed_weight',
+)
+
+
+def restore_stage2_eval_config(args):
+    """Restore the exact training configuration used by a unified checkpoint."""
+    config_path = os.path.join(args.save_path, 'backup', 'args.json')
+    if not os.path.exists(config_path):
+        return
+    with open(config_path, 'r', encoding='utf-8') as handle:
+        saved_args = json.load(handle)
+    for key in _STAGE2_EVAL_CONFIG_KEYS:
+        if key in saved_args:
+            setattr(args, key, saved_args[key])
+
+
+def resolve_eval_growsp(args, epoch):
+    """Recover the region count scheduled for a checkpoint epoch."""
+    if getattr(args, 'fixed_weight', False):
+        return 59
+    resume_path = os.path.join(
+        args.save_path, 'ckpts', 'model_{}_resume.pth'.format(epoch)
+    )
+    start_grow_epoch = args.max_epoch[0]
+    if os.path.exists(resume_path):
+        resume_state = torch.load(resume_path, map_location='cpu')
+        start_grow_epoch = int(resume_state.get('start_grow_epoch', start_grow_epoch))
+    try:
+        checkpoint_epoch = int(epoch)
+    except (TypeError, ValueError):
+        # Named checkpoints such as ``best`` are produced after growing. Their
+        # resume state has no matching numeric filename, so use the final size.
+        return int(args.growsp_end)
+    progress = (checkpoint_epoch - start_grow_epoch) / max(
+        float(args.max_epoch[1]), 1.0
+    )
+    target = int(
+        args.growsp_start - progress * (args.growsp_start - args.growsp_end)
+    )
+    return max(int(args.growsp_end), min(int(args.growsp_start), target))
+
+
+def grow_eval_regions(args, point_features, point_coords, point_colors, regions, target):
+    """Apply the training-time GrowSP merge to one test scene without GT."""
+    regions = regions.to(point_features.device).long().view(-1).clone()
+    if not (
+        regions.numel() == point_features.size(0)
+        == point_coords.size(0) == point_colors.size(0)
+    ):
+        raise ValueError('GrowSP evaluation inputs must have the same point count.')
+
+    # S3DIS training drops tiny initial regions and compacts the remaining IDs
+    # before K-means. Reproduce that preprocessing exactly at test time.
+    for region_id in torch.unique(regions[regions >= 0]):
+        region_mask = regions == region_id
+        if int(region_mask.sum().item()) < int(args.drop_threshold):
+            regions[region_mask] = -1
+    valid_mask = regions >= 0
+    if not valid_mask.any():
+        return regions
+    unique_regions, compact_regions = torch.unique(
+        regions[valid_mask], sorted=True, return_inverse=True
+    )
+    del unique_regions
+    regions[valid_mask] = compact_regions
+    region_count = int(compact_regions.max().item()) + 1
+    target = min(int(target), region_count)
+    if target >= region_count:
+        return regions
+
+    valid_regions = regions[valid_mask]
+    counts = point_features.new_zeros(region_count, 1)
+    counts.index_add_(
+        0, valid_regions,
+        point_features.new_ones((int(valid_mask.sum().item()), 1)),
+    )
+
+    def region_mean(values):
+        means = values.new_zeros(region_count, values.size(1))
+        means.index_add_(0, valid_regions, values[valid_mask])
+        return means / counts.clamp_min(1.0)
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(point_coords.detach().cpu().numpy())
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=3, max_nn=30)
+    )
+    normals = torch.as_tensor(
+        np.asarray(pcd.normals), dtype=point_features.dtype,
+        device=point_features.device,
+    )
+    descriptors = torch.cat(
+        [
+            F.normalize(region_mean(point_features), dim=1),
+            float(args.w_rgb) * region_mean(point_colors),
+            float(args.w_xyz) * region_mean(point_coords) * float(args.voxel_size),
+            float(args.w_norm) * region_mean(normals),
+        ],
+        dim=1,
+    )
+    merged_ids = torch.from_numpy(
+        KMeans(
+            n_clusters=target, n_init=5, random_state=0, n_jobs=5
+        ).fit_predict(descriptors.detach().cpu().numpy())
+    ).to(regions.device).long()
+    grown = regions.clone()
+    grown[valid_mask] = merged_ids[valid_regions]
+    return grown
+
+
+def _extract_checkpoint_state(checkpoint, key):
+    if isinstance(checkpoint, dict) and key in checkpoint:
+        return checkpoint[key]
+    return checkpoint
+
+
+def _build_eval_backbone(args):
+    kwargs = dict(
+        in_channels=args.input_dim,
+        out_channels=args.primitive_num,
+        conv1_kernel_size=args.conv1_kernel_size,
+        config=args,
+    )
+    if args.model == 'res16fpn18':
+        return Res16FPN18(**kwargs)
+    if args.model == 'res16unet14':
+        return Res16UNet14(**kwargs)
+    raise ValueError('Unsupported evaluation model: {}'.format(args.model))
 
 
 def reduce_primitive_logits(primitive_logits, cluster_pred, semantic_class, mode='max'):
@@ -257,6 +437,9 @@ def eval_once(args, model, test_loader, classifier, primitive_classifier=None, c
         "split_regions": 0,
         "consistency_regions": 0,
         "changed_trusted_points": 0,
+        "decomposition_accepted_regions": 0,
+        "refinement_accepted_regions": 0,
+        "refinement_rejected_regions": 0,
     }
     for data in test_loader:
         with torch.no_grad():
@@ -268,7 +451,75 @@ def eval_once(args, model, test_loader, classifier, primitive_classifier=None, c
 
             region = region.squeeze()
             #
-            if refiner is not None and getattr(args, 'stage3_enable', False):
+            if (
+                getattr(args, 'stage2_split_refine_enable', False)
+                and hasattr(model, 'refine_candidate_features')
+            ):
+                base_scores = F.linear(
+                    F.normalize(feats), F.normalize(classifier.weight)
+                )
+                base_preds = torch.argmax(base_scores, dim=1).cpu()
+                point_batch_ids = coords[:, 0].long().cuda()
+                point_coords = coords[:, 1:].float().cuda()
+                point_colors = features[:, :3].float().cuda()
+                candidate_regions = region.cuda().long().view(-1)
+                if getattr(args, 'stage2_eval_grow_regions', True):
+                    candidate_regions = grow_eval_regions(
+                        args,
+                        feats,
+                        point_coords,
+                        point_colors,
+                        candidate_regions,
+                        getattr(args, 'stage2_eval_growsp', args.growsp_end),
+                    )
+                primitive_mapping = None
+                if cluster_pred is not None:
+                    primitive_mapping = torch.as_tensor(
+                        cluster_pred, dtype=torch.long, device=feats.device
+                    )
+                output = run_stage2_feature_pipeline(
+                    Stage2FeatureConfig.from_args(args),
+                    model,
+                    feats,
+                    point_coords,
+                    point_colors,
+                    base_scores,
+                    candidate_regions,
+                    point_batch_ids,
+                    primitive_classifier.weight if primitive_classifier is not None else None,
+                    primitive_mapping,
+                )
+                refined_scores = F.linear(
+                    F.normalize(output.refined_features),
+                    F.normalize(classifier.weight),
+                )
+                preds = torch.argmax(refined_scores, dim=1).cpu()
+                changed = preds != base_preds
+                candidate_mask_cpu = output.candidate_mask.cpu()
+                stats["changed_points"] += int(changed.sum().item())
+                stats["trusted_points"] += int(candidate_mask_cpu.sum().item())
+                stats["total_points"] += int(preds.numel())
+                stats["queries"] += int(output.query_indices.numel())
+                stats["split_regions"] += int(output.stats["proposed_splits"])
+                stats["changed_trusted_points"] += int(
+                    (changed & candidate_mask_cpu).sum().item()
+                )
+                stats["accepted_points"] = stats.get("accepted_points", 0) + int(
+                    output.accept_mask.sum().item()
+                )
+                stats["rollback_points"] = stats.get("rollback_points", 0) + int(
+                    output.refinement_rollback_mask.sum().item()
+                )
+                stats["decomposition_accepted_regions"] += int(
+                    output.stats["accepted_splits"]
+                )
+                stats["refinement_accepted_regions"] += int(
+                    output.stats["refinement_accepted_splits"]
+                )
+                stats["refinement_rejected_regions"] += int(
+                    output.stats["refinement_rejected_splits"]
+                )
+            elif refiner is not None and getattr(args, 'stage3_enable', False):
                 base_scores = F.linear(F.normalize(feats), F.normalize(classifier.weight))
                 point_batch_ids = coords[:, 0].long().cuda()
                 point_coords = coords[:, 1:].float().cuda()
@@ -529,16 +780,48 @@ def compute_unsupervised_metrics(all_preds, all_labels, sem_num):
 
 def eval(epoch, args, test_areas = ['Area_5']):
 
-    model = Res16FPN18(in_channels=args.input_dim, out_channels=args.primitive_num, conv1_kernel_size=args.conv1_kernel_size, config=args).cuda()
-    model_state = torch.load(
+    model_checkpoint = torch.load(
         os.path.join(args.save_path, 'model_' + str(epoch) + '_checkpoint.pth'),
         map_location='cpu',
     )
-    model.load_state_dict(extract_backbone_state_dict(model_state))
+    model_state = _extract_checkpoint_state(model_checkpoint, 'model_state_dict')
+    unified_checkpoint = any(
+        key.startswith('feature_context.') for key in model_state
+    )
+    if unified_checkpoint:
+        args.stage2_split_refine_enable = True
+        restore_stage2_eval_config(args)
+        args.stage2_eval_growsp = resolve_eval_growsp(args, epoch)
+
+    backbone = _build_eval_backbone(args)
+    if unified_checkpoint:
+        model = UnifiedBackboneFeatureModel(
+            backbone,
+            feat_dim=args.feats_dim,
+            hidden_dim=args.refine_hidden_dim,
+            num_heads=args.refine_num_heads,
+            dropout=args.refine_dropout,
+        )
+        model.load_state_dict(model_state)
+        print(
+            'Loaded unified feature-context model; inference GrowSP target {}.'.format(
+                args.stage2_eval_growsp
+            )
+        )
+    else:
+        model = backbone
+        model.load_state_dict(extract_backbone_state_dict(model_state))
+    model = model.cuda()
     model.eval()
 
     cls = torch.nn.Linear(args.feats_dim, args.primitive_num, bias=False).cuda()
-    cls.load_state_dict(torch.load(os.path.join(args.save_path, 'cls_' + str(epoch) + '_checkpoint.pth')))
+    classifier_checkpoint = torch.load(
+        os.path.join(args.save_path, 'cls_' + str(epoch) + '_checkpoint.pth'),
+        map_location='cpu',
+    )
+    cls.load_state_dict(
+        _extract_checkpoint_state(classifier_checkpoint, 'classifier_state_dict')
+    )
     cls.eval()
 
     primitive_centers = cls.weight.data###[300, 128]
@@ -580,7 +863,13 @@ def eval(epoch, args, test_areas = ['Area_5']):
             print('Refiner checkpoint not found; evaluating without refinement.')
 
     test_dataset = S3DIStest(args, areas=test_areas)
-    test_loader = DataLoader(test_dataset, batch_size=1, collate_fn=cfl_collate_fn_test(), num_workers=4, pin_memory=True)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=1,
+        collate_fn=cfl_collate_fn_test(),
+        num_workers=args.workers,
+        pin_memory=True,
+    )
 
     preds, refined_preds, labels, refine_stats = eval_once(args, model, test_loader, classifier, primitive_classifier=cls, cluster_pred=cluster_pred, refiner=refiner)
     all_preds = torch.cat(preds).numpy()
@@ -611,6 +900,8 @@ def eval(epoch, args, test_areas = ['Area_5']):
     })
     args.eval_refine_stats = refine_stats
 
+    if unified_checkpoint:
+        return refined_o_Acc, refined_m_Acc, refined_s
     if getattr(args, 'stage3_enable', False) and refiner is not None:
         return refined_o_Acc, refined_m_Acc, refined_s
     return o_Acc, m_Acc, s
@@ -625,7 +916,11 @@ if __name__ == '__main__':
     o_Acc, m_Acc, s = eval(epoch, args, parse_test_areas(args.test_area))
     print('Epoch: {}, oAcc {:.2f}  mAcc {:.2f} IoUs'.format(epoch, o_Acc, m_Acc), s)
     stats = getattr(args, 'eval_refine_stats', None)
-    if stats and (args.refine_enable or args.stage3_enable):
+    if stats and (
+        args.refine_enable
+        or args.stage3_enable
+        or getattr(args, 'stage2_split_refine_enable', False)
+    ):
         print(
             'Epoch: {}, Refined oAcc {:.2f}  mAcc {:.2f}  delta_mIoU {:+.2f}  '
             'changed {:.2f}% trusted {:.2f}% keep {:.2f}% changed@trusted {:.2f}% queries {} split_regions {} consistency_regions {}'.format(
@@ -643,3 +938,13 @@ if __name__ == '__main__':
             ),
             stats['refined_s'],
         )
+        if getattr(args, 'stage2_split_refine_enable', False):
+            print(
+                'Unified feature context: decomposition accepted {}, refinement '
+                'accepted {}, rejected {}, accepted points {}.'.format(
+                    stats.get('decomposition_accepted_regions', 0),
+                    stats.get('refinement_accepted_regions', 0),
+                    stats.get('refinement_rejected_regions', 0),
+                    stats.get('accepted_points', 0),
+                )
+            )

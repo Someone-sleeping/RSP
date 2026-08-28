@@ -31,6 +31,36 @@ class Stage2FeatureConfig:
     primitive_support_tolerance: float = 0.01
     separation_weight: float = 0.25
 
+    @classmethod
+    def from_args(cls, args):
+        """Build one shared configuration for training, clustering and eval."""
+        return cls(
+            residual_scale=getattr(args, "stage2_feature_residual_scale", 0.1),
+            backbone_gradient_scale=getattr(
+                args, "stage2_backbone_gradient_scale", 0.1
+            ),
+            min_region_points=getattr(args, "stage2_min_region_points", 20),
+            min_child_points=getattr(args, "stage2_min_child_points", 8),
+            max_regions_per_scene=getattr(args, "stage2_max_regions", 20),
+            purity_threshold=getattr(args, "stage2_purity_th", 0.92),
+            entropy_threshold=getattr(args, "stage2_entropy_th", 0.25),
+            min_split_confidence=getattr(args, "stage2_min_split_conf", 0.35),
+            verifier_tolerance=getattr(args, "stage2_verifier_tolerance", 0.0),
+            max_residual_norm=getattr(args, "stage2_max_residual_norm", 1.0),
+            min_structure_gain=getattr(args, "stage2_min_structure_gain", 0.01),
+            min_child_separation=getattr(
+                args, "stage2_min_child_separation", 0.05
+            ),
+            min_primitive_gain=getattr(args, "stage2_min_primitive_gain", 0.005),
+            min_primitive_margin=getattr(
+                args, "stage2_min_primitive_margin", 0.01
+            ),
+            primitive_top_k=getattr(args, "stage2_primitive_top_k", 3),
+            primitive_support_tolerance=getattr(
+                args, "stage2_primitive_support_tolerance", 0.01
+            ),
+        )
+
     def split_config(self):
         return Stage3Config(
             query_scale=self.query_scale,

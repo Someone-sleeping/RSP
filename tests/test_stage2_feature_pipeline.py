@@ -15,6 +15,7 @@ from lib.my_utils import load_resume_checkpoint
 from lib.utils import build_split_primitive_overrides, get_pseudo
 from models.feature_refiner import CandidateFeatureContextBlock, CandidateFeatureRefiner
 from models.unified_feature_model import UnifiedBackboneFeatureModel
+from eval_S3DIS import grow_eval_regions, resolve_eval_growsp
 
 
 def _mixed_region():
@@ -298,6 +299,40 @@ def test_grown_regions_are_saved_for_the_training_round(tmp_path):
 
     saved = np.load(tmp_path / 'scene_grown_region.npy')
     assert np.array_equal(saved, np.array([0, 0, 1, -1]))
+
+
+def test_named_unified_checkpoint_uses_final_growsp_size(tmp_path):
+    args = SimpleNamespace(
+        save_path=str(tmp_path),
+        max_epoch=[500, 800],
+        growsp_start=80,
+        growsp_end=20,
+    )
+
+    assert resolve_eval_growsp(args, 'best') == 20
+
+
+def test_eval_region_growing_drops_tiny_regions_and_compacts_ids():
+    args = SimpleNamespace(
+        drop_threshold=3,
+        w_rgb=1.0,
+        w_xyz=0.2,
+        w_norm=0.8,
+        voxel_size=0.05,
+    )
+    features = F.normalize(torch.randn(10, 4), dim=1)
+    coordinates = torch.stack(
+        [torch.arange(10).float(), torch.zeros(10), torch.zeros(10)], dim=1
+    )
+    colors = torch.zeros(10, 3)
+    regions = torch.tensor([4, 4, 8, 8, 8, 8, 12, 12, 12, 12])
+
+    grown = grow_eval_regions(
+        args, features, coordinates, colors, regions, target=1
+    )
+
+    assert grown[:2].tolist() == [-1, -1]
+    assert torch.unique(grown[2:]).tolist() == [0]
 
 
 def test_verified_children_override_labels_after_parent_primitive_clustering(tmp_path):

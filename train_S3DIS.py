@@ -303,24 +303,7 @@ def main(args, logger):
     if args.stage2_split_refine_enable:
         if not hasattr(model, 'refine_candidate_features'):
             raise TypeError('Stage-2 feature refinement requires the unified model wrapper.')
-        stage2_feature_config = Stage2FeatureConfig(
-            residual_scale=args.stage2_feature_residual_scale,
-            backbone_gradient_scale=args.stage2_backbone_gradient_scale,
-            min_region_points=args.stage2_min_region_points,
-            min_child_points=args.stage2_min_child_points,
-            max_regions_per_scene=args.stage2_max_regions,
-            purity_threshold=args.stage2_purity_th,
-            entropy_threshold=args.stage2_entropy_th,
-            min_split_confidence=args.stage2_min_split_conf,
-            verifier_tolerance=args.stage2_verifier_tolerance,
-            max_residual_norm=args.stage2_max_residual_norm,
-            min_structure_gain=args.stage2_min_structure_gain,
-            min_child_separation=args.stage2_min_child_separation,
-            min_primitive_gain=args.stage2_min_primitive_gain,
-            min_primitive_margin=args.stage2_min_primitive_margin,
-            primitive_top_k=args.stage2_primitive_top_k,
-            primitive_support_tolerance=args.stage2_primitive_support_tolerance,
-        )
+        stage2_feature_config = Stage2FeatureConfig.from_args(args)
         stage2_feature_module = Stage2FeatureModule(model, stage2_feature_config)
         logger.info(model.feature_context)
 
@@ -792,7 +775,12 @@ def maybe_reset_refiner(args, refiner, logger):
 
 def log_refine_eval_stats(args, logger, epoch):
     stats = getattr(args, 'eval_refine_stats', None)
-    if not stats or not getattr(args, 'refine_enable', False):
+    refinement_enabled = (
+        getattr(args, 'refine_enable', False)
+        or getattr(args, 'stage3_enable', False)
+        or getattr(args, 'stage2_split_refine_enable', False)
+    )
+    if not stats or not refinement_enabled:
         return
     logger.info(
         'Epoch: {:02d}, Refined oAcc {:.2f}  mAcc {:.2f}  delta_mIoU {:+.2f}  '
@@ -808,6 +796,17 @@ def log_refine_eval_stats(args, logger, epoch):
             stats['queries'],
         ) + stats['refined_s']
     )
+    if getattr(args, 'stage2_split_refine_enable', False):
+        logger.info(
+            'Epoch: {:02d}, unified feature context decomposition accepted {}, '
+            'refinement accepted {}, rejected {}, accepted points {}'.format(
+                epoch,
+                stats.get('decomposition_accepted_regions', 0),
+                stats.get('refinement_accepted_regions', 0),
+                stats.get('refinement_rejected_regions', 0),
+                stats.get('accepted_points', 0),
+            )
+        )
 
 
 def build_semantic_classifier(classifier, primitive_to_semantic, semantic_class):
