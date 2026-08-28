@@ -277,7 +277,10 @@ def load_resume_checkpoint(
     model_state = checkpoint['model_state_dict']
     args.resume_has_feature_refiner = (
         'feature_refiner_state_dict' in checkpoint
-        or any(key.startswith('feature_context.') for key in model_state)
+        or any(
+            key.startswith('feature_refiner.') or key.startswith('feature_context.')
+            for key in model_state
+        )
     )
     args.resume_training_stage = checkpoint.get('training_stage', '')
     model.load_state_dict(model_state)

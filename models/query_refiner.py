@@ -22,8 +22,8 @@ def resolve_min_temporal_votes(requested_votes, reference_count):
     return int(requested_votes)
 
 
-class CandidateBasedRefiner(nn.Module):
-    """Predict semantic residuals conditioned on candidate point queries.
+class LegacyLogitResidualRefiner(nn.Module):
+    """Legacy semantic-logit residual model kept for archived experiments.
 
     Query tokens may read global scene context, but the returned residual can be
     gated to candidate points. This keeps contextual reasoning global while
@@ -194,9 +194,10 @@ class CandidateBasedRefiner(nn.Module):
         return total_delta
 
 
-# Historical checkpoints only store parameter names, so this alias keeps old
-# training and evaluation commands loadable without duplicating an implementation.
-ErrorQueryRefiner = CandidateBasedRefiner
+# Historical checkpoints only store parameter names, so these aliases keep old
+# experiment commands loadable. The current Stage-2 method does not use them.
+CandidateBasedRefiner = LegacyLogitResidualRefiner
+ErrorQueryRefiner = LegacyLogitResidualRefiner
 
 
 def refined_cross_entropy(refined_logits, pseudo_labels, trusted_mask, ignore_index=-1):

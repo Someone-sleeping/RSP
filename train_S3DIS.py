@@ -10,14 +10,18 @@ import MinkowskiEngine as ME
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from models.fpn import Res16FPN18
-from models.query_refiner import CandidateBasedRefiner, refined_cross_entropy, refinement_keep_kl, delta_l2
+from models.query_refiner import (
+    LegacyLogitResidualRefiner,
+    refined_cross_entropy,
+    refinement_keep_kl,
+    delta_l2,
+)
 from models.learnable_superpoint import (
     SemanticDifferenceSuperpointLearner,
     verified_region_supervision_loss,
 )
 from eval_S3DIS import eval
 from lib.utils import (
-    build_split_primitive_overrides,
     get_pseudo,
     get_sp_feature,
     get_fixclassifier,
@@ -100,7 +104,8 @@ def parse_args():
     parser.add_argument('--region_weight_enable', action='store_true', default=False, help='Enable region weight')
     parser.add_argument('--double_ssl', action='store_true', default=False, help='Enable double SSL')
     parser.add_argument('--plot', action='store_true', default=False, help='Enable double SSL')
-    parser.add_argument('--refine_enable', action='store_true', default=False, help='Enable error-query semantic refinement')
+    parser.add_argument('--refine_enable', action='store_true', default=False,
+                        help='enable the legacy semantic-logit residual experiment')
     parser.add_argument('--refine_lambda', type=float, default=0.3, help='loss weight for query refinement')
     parser.add_argument('--refine_lr', type=float, default=1e-3, help='learning rate for the refinement optimizer')
     parser.add_argument('--refine_weight_decay', type=float, default=1e-4, help='weight decay for the refinement optimizer')
@@ -164,11 +169,12 @@ def parse_args():
                         help='fraction of Stage 2 completed before split-aware refinement starts')
     parser.add_argument('--stage2_feature_refiner_lr', type=float, default=1e-2,
                         help='SGD learning rate for the context group inside the unified model')
-    parser.add_argument('--stage2_feature_residual_scale', type=float, default=0.1)
     parser.add_argument('--stage2_backbone_gradient_scale', type=float, default=0.1)
     parser.add_argument('--stage2_split_lambda', type=float, default=0.2)
     parser.add_argument('--stage2_feature_lambda', type=float, default=0.1)
-    parser.add_argument('--stage2_residual_lambda', type=float, default=0.01)
+    parser.add_argument('--stage2_feature_update_lambda', '--stage2_residual_lambda',
+                        dest='stage2_feature_update_lambda', type=float, default=0.01,
+                        help='regularization weight for accepted feature displacement')
     parser.add_argument('--stage2_refiner_primitive_lambda', type=float, default=0.05)
     parser.add_argument('--stage2_min_region_points', type=int, default=20)
     parser.add_argument('--stage2_min_child_points', type=int, default=8)
@@ -177,15 +183,14 @@ def parse_args():
     parser.add_argument('--stage2_entropy_th', type=float, default=0.25)
     parser.add_argument('--stage2_min_split_conf', type=float, default=0.35)
     parser.add_argument('--stage2_verifier_tolerance', type=float, default=0.0)
-    parser.add_argument('--stage2_max_residual_norm', type=float, default=1.0)
+    parser.add_argument('--stage2_max_feature_update_norm', '--stage2_max_residual_norm',
+                        dest='stage2_max_feature_update_norm', type=float, default=1.0)
     parser.add_argument('--stage2_min_structure_gain', type=float, default=0.01)
     parser.add_argument('--stage2_min_child_separation', type=float, default=0.05)
     parser.add_argument('--stage2_min_primitive_gain', type=float, default=0.005)
     parser.add_argument('--stage2_min_primitive_margin', type=float, default=0.01)
     parser.add_argument('--stage2_primitive_top_k', type=int, default=3)
     parser.add_argument('--stage2_primitive_support_tolerance', type=float, default=0.01)
-    parser.add_argument('--stage2_override_min_gain', type=float, default=0.05)
-    parser.add_argument('--stage2_override_min_margin', type=float, default=0.02)
     parser.add_argument('--stage2_max_steps', type=int, default=-1,
                         help='optional batches per Stage-2 epoch for smoke tests; -1 uses all batches')
     parser.add_argument('--stage2_stop_epoch', type=int, default=-1,
@@ -203,7 +208,7 @@ def parse_test_areas(test_area):
 def build_training_optimizer(args, model, backbone_lr=None):
     """Build one optimizer for both backbone and integrated feature context."""
     backbone_lr = args.lr if backbone_lr is None else float(backbone_lr)
-    if hasattr(model, 'context_parameters'):
+    if hasattr(model, 'feature_refiner_parameters'):
         parameter_groups = [
             {
                 'params': list(model.backbone_parameters()),
@@ -212,10 +217,10 @@ def build_training_optimizer(args, model, backbone_lr=None):
                 'name': 'backbone',
             },
             {
-                'params': list(model.context_parameters()),
+                'params': list(model.feature_refiner_parameters()),
                 'lr': args.stage2_feature_refiner_lr,
                 'poly_schedule': False,
-                'name': 'feature_context',
+                'name': 'candidate_feature_refiner',
             },
         ]
     else:
@@ -236,6 +241,18 @@ def main(args, logger):
         raise ValueError('Choose the Stage-3 decomposer or the legacy learnable superpoint experiment, not both.')
     if args.stage2_split_refine_enable and args.learnable_sp_enable:
         raise ValueError('Stage-2 split refinement and the legacy learnable superpoint module are mutually exclusive.')
+    if args.stage2_split_refine_enable and (args.refine_enable or args.stage3_enable):
+        raise ValueError(
+            'Direct Stage-2 feature refinement cannot be combined with a legacy '
+            'semantic-logit residual experiment.'
+        )
+    if args.stage2_split_refine_enable and (
+        args.refine_freeze_backbone or args.refine_teacher_ckpt_dir
+    ):
+        raise ValueError(
+            'Direct Stage-2 feature refinement jointly trains the backbone and '
+            'feature Refiner; frozen-teacher mode is unsupported.'
+        )
     if args.start_stage2_from_resume and not args.resume:
         raise ValueError('--start_stage2_from_resume requires --resume.')
     if args.refine_teacher_ckpt_dir:
@@ -256,7 +273,7 @@ def main(args, logger):
     logger.info(f"REFINE_FREEZE_BACKBONE set to: {args.refine_freeze_backbone}")
     logger.info(f"LEARNABLE_SP_ENABLE(training-integrated structure) set to: {args.learnable_sp_enable}")
     logger.info(f"STAGE3_ENABLE(split + Candidate-based Refiner + Conservative Verifier) set to: {args.stage3_enable}")
-    logger.info(f"STAGE2_SPLIT_REFINE_ENABLE(contextual feature refinement) set to: {args.stage2_split_refine_enable}")
+    logger.info(f"STAGE2_SPLIT_REFINE_ENABLE(direct candidate feature refinement) set to: {args.stage2_split_refine_enable}")
     logger.info("------------------------------")
     backup_selected(args)
     all_areas = ['Area_1', 'Area_2', 'Area_3', 'Area_4', 'Area_5', 'Area_6']
@@ -280,7 +297,7 @@ def main(args, logger):
     model = model.cuda()
     candidate_refiner = None
     if args.refine_enable or args.stage3_enable:
-        candidate_refiner = CandidateBasedRefiner(
+        candidate_refiner = LegacyLogitResidualRefiner(
             feat_dim=args.feats_dim,
             num_classes=args.semantic_class,
             hidden_dim=args.refine_hidden_dim,
@@ -301,11 +318,11 @@ def main(args, logger):
     stage2_feature_config = None
     stage2_feature_module = None
     if args.stage2_split_refine_enable:
-        if not hasattr(model, 'refine_candidate_features'):
+        if not hasattr(model, 'update_candidate_features'):
             raise TypeError('Stage-2 feature refinement requires the unified model wrapper.')
         stage2_feature_config = Stage2FeatureConfig.from_args(args)
         stage2_feature_module = Stage2FeatureModule(model, stage2_feature_config)
-        logger.info(model.feature_context)
+        logger.info(model.feature_refiner)
 
     optimizer = None
     if not args.refine_freeze_backbone:
@@ -410,7 +427,10 @@ def main(args, logger):
     split_refine_was_active = bool(
         args.stage2_split_refine_enable
         and getattr(args, 'resume_has_feature_refiner', False)
-        and getattr(args, 'resume_training_stage', '') == 'stage2_split_feature_refiner'
+        and getattr(args, 'resume_training_stage', '') in (
+            'stage2_split_feature_refiner',
+            'stage2_direct_feature_refiner',
+        )
     )
     for epoch in range(current_epoch + 1, stage2_loop_end + 1):
         stage2_progress = (epoch - start_grow_epoch) / max(float(args.max_epoch[1]), 1.0)
@@ -433,7 +453,7 @@ def main(args, logger):
             )
             refiner_optimizer = maybe_reset_refiner(args, candidate_refiner, logger)
         if split_refine_active:
-            train_stage2_split_refiner(
+            train_stage2_feature_model(
                 train_loader, logger, model, optimizer, scheduler, classifier,
                 primitive_to_semantic, stage2_feature_config, epoch,
             )
@@ -446,7 +466,10 @@ def main(args, logger):
             )
 
         if epoch % 10 == 0 or epoch == stage2_loop_end:
-            args.training_stage = 'stage2_split_feature_refiner' if split_refine_active else 'growsp_stage2'
+            args.training_stage = (
+                'stage2_direct_feature_refiner'
+                if split_refine_active else 'growsp_stage2'
+            )
             save_checkpoints(
                 args, epoch, model, optimizer, scheduler, classifier, is_Growing, start_grow_epoch, logger,
                 refiner=candidate_refiner if args.refine_enable else None,
@@ -639,11 +662,13 @@ def cluster(
     structure_stats = getattr(args, 'cluster_superpoint_stats', None)
     if structure_stats and structure_stats['scenes'] > 0:
         coverage = structure_stats['supervised_points'] / max(structure_stats['valid_points'], 1)
-        refined_coverage = structure_stats['refined_points'] / max(structure_stats['valid_points'], 1)
+        feature_coverage = structure_stats['feature_updated_points'] / max(
+            structure_stats['valid_points'], 1
+        )
         logger.info(
             'Epoch: {}, grow-then-split clustering: scenes {}, candidates {}, proposals {}, '
             'decomposition accepted {}, rejected {} (primitive {}), coverage {:.3f}%, '
-            'refinement accepted {}, rejected {} (score {}, norm {}), refined coverage {:.3f}%'.format(
+            'feature updates accepted {}, rejected {} (score {}, norm {}), update coverage {:.3f}%'.format(
                 epoch,
                 structure_stats['scenes'],
                 structure_stats['candidate_regions'],
@@ -652,11 +677,11 @@ def cluster(
                 structure_stats['rejected_splits'],
                 structure_stats['primitive_rejections'],
                 100.0 * coverage,
-                structure_stats['refinement_accepted_splits'],
-                structure_stats['refinement_rejected_splits'],
-                structure_stats['refinement_score_rejections'],
-                structure_stats['residual_norm_rejections'],
-                100.0 * refined_coverage,
+                structure_stats['feature_updates_accepted'],
+                structure_stats['feature_updates_rejected'],
+                structure_stats['feature_score_rejections'],
+                structure_stats['feature_norm_rejections'],
+                100.0 * feature_coverage,
             )
         )
     sp_feats = torch.cat(feats, dim=0)### will do Kmeans with geometric distance
@@ -691,29 +716,11 @@ def cluster(
     primitive_centers_np = primitive_centers.cpu().numpy()
 
     '''Compute and Save Pseudo Labels'''
-    primitive_overrides = None
-    if active_superpoint_module is not None and getattr(active_superpoint_module, 'apply_after_grow', False):
-        primitive_overrides, override_stats = build_split_primitive_overrides(
-            context,
-            primitive_centers,
-            primitive_labels,
-            sp_index,
-            min_gain=args.stage2_override_min_gain,
-            min_margin=args.stage2_override_min_margin,
-        )
-        logger.info(
-            'Epoch: %d, local primitive overrides: children %d, points %d, changed %.3f%%',
-            epoch,
-            override_stats['children'],
-            override_stats['points'],
-            100.0 * override_stats['points'] / max(override_stats['valid_points'], 1),
-        )
     all_pseudo, all_gt, all_pseudo_gt, sp_gt_labels, pe_gt_labels = get_pseudo(
         args,
         context,
         primitive_labels,
         sp_index,
-        primitive_overrides=primitive_overrides,
     )
     logger.info('labelled points ratio %.2f clustering time: %.2fs', (all_pseudo!=-1).sum()/all_pseudo.shape[0], time.time() - time_start)
     if (pe_gt_labels < 0).any():
@@ -798,12 +805,12 @@ def log_refine_eval_stats(args, logger, epoch):
     )
     if getattr(args, 'stage2_split_refine_enable', False):
         logger.info(
-            'Epoch: {:02d}, unified feature context decomposition accepted {}, '
-            'refinement accepted {}, rejected {}, accepted points {}'.format(
+            'Epoch: {:02d}, direct feature model decomposition accepted {}, '
+            'feature updates accepted {}, rejected {}, accepted points {}'.format(
                 epoch,
                 stats.get('decomposition_accepted_regions', 0),
-                stats.get('refinement_accepted_regions', 0),
-                stats.get('refinement_rejected_regions', 0),
+                stats.get('feature_updates_accepted', 0),
+                stats.get('feature_updates_rejected', 0),
                 stats.get('accepted_points', 0),
             )
         )
@@ -965,17 +972,32 @@ def train(
                 min_region_points=args.refine_min_region_points,
                 max_queries_per_scene=args.refine_max_queries,
             )
-            delta_logits = refiner(feats_for_refine, point_coords, point_batch_ids, query_indices)
-            refined_logits = logits_for_refine + args.refine_residual_scale * delta_logits
+            legacy_logit_update = refiner(
+                feats_for_refine, point_coords, point_batch_ids, query_indices
+            )
+            legacy_candidate_logits = (
+                logits_for_refine
+                + args.refine_residual_scale * legacy_logit_update
+            )
             refine_targets = smooth_targets_by_region(semantic_targets, dynamic_regions, refine_mask)
-            loss_refine_ce = refined_cross_entropy(refined_logits * 3, refine_targets, refine_mask)
-            loss_keep = refinement_keep_kl(refined_logits * 3, logits_for_refine * 3, keep_mask)
-            loss_delta = delta_l2(delta_logits, refine_mask | keep_mask)
-            loss_refine = loss_refine_ce + args.refine_keep_lambda * loss_keep + args.refine_delta_lambda * loss_delta
+            loss_refine_ce = refined_cross_entropy(
+                legacy_candidate_logits * 3, refine_targets, refine_mask
+            )
+            loss_keep = refinement_keep_kl(
+                legacy_candidate_logits * 3, logits_for_refine * 3, keep_mask
+            )
+            loss_update = delta_l2(
+                legacy_logit_update, refine_mask | keep_mask
+            )
+            loss_refine = (
+                loss_refine_ce
+                + args.refine_keep_lambda * loss_keep
+                + args.refine_delta_lambda * loss_update
+            )
             losses['loss_refine'] = args.refine_lambda * loss_refine
             losses['refine_ce'] = loss_refine_ce
             losses['refine_keep_loss'] = args.refine_keep_lambda * loss_keep
-            losses['refine_delta_loss'] = args.refine_delta_lambda * loss_delta
+            losses['refine_delta_loss'] = args.refine_delta_lambda * loss_update
             losses['refine_trusted'] = logits.new_tensor(query_stats['trusted_ratio'])
             losses['refine_keep'] = logits.new_tensor(query_stats['keep_ratio'])
             losses['refine_candidate'] = logits.new_tensor(query_stats['candidate_ratio'])
@@ -1038,7 +1060,7 @@ def train(
             losses_display.clear()
 
 
-def train_stage2_split_refiner(
+def train_stage2_feature_model(
     train_loader,
     logger,
     model,
@@ -1049,7 +1071,7 @@ def train_stage2_split_refiner(
     feature_config,
     epoch,
 ):
-    """Jointly optimize the unified backbone and candidate feature context."""
+    """Train GrowSP directly on verified candidate-conditioned features."""
     train_loader.dataset.mode = 'train'
     model.train()
     semantic_centers = build_semantic_classifier(
@@ -1062,9 +1084,9 @@ def train_stage2_split_refiner(
         'split': 0.0,
         'feature': 0.0,
         'accepted': 0,
-        'refined': 0,
-        'refine_score_rejected': 0,
-        'refine_norm_rejected': 0,
+        'feature_updated': 0,
+        'feature_score_rejected': 0,
+        'feature_norm_rejected': 0,
         'candidates': 0,
         'steps': 0,
     }
@@ -1096,11 +1118,15 @@ def train_stage2_split_refiner(
             classifier.weight,
             primitive_to_semantic,
         )
-        base_logits = F.linear(point_features, F.normalize(classifier.weight))
-        base_primitive_loss = F.cross_entropy(
-            base_logits * 3, pseudo_labels, ignore_index=-1
+        # The main GrowSP objective consumes verified features. Accepted
+        # candidates therefore train the feature Refiner and the backbone in the
+        # same primitive classification path; rejected points remain unchanged.
+        primitive_logits = F.linear(
+            output.verified_features, F.normalize(classifier.weight)
         )
-        primitive_loss = base_primitive_loss
+        primitive_loss = F.cross_entropy(
+            primitive_logits * 3, pseudo_labels, ignore_index=-1
+        )
         feature_losses = stage2_feature_losses(
             output,
             semantic_centers,
@@ -1112,7 +1138,7 @@ def train_stage2_split_refiner(
             + args.stage2_refiner_primitive_lambda * feature_losses['primitive']
             + args.stage2_split_lambda * feature_losses['semantic']
             + args.stage2_feature_lambda * feature_losses['structure']
-            + args.stage2_residual_lambda * feature_losses['residual']
+            + args.stage2_feature_update_lambda * feature_losses['feature_update']
         )
 
         optimizer.zero_grad()
@@ -1126,9 +1152,13 @@ def train_stage2_split_refiner(
         running['split'] += float(feature_losses['semantic'].detach().item())
         running['feature'] += float(feature_losses['structure'].detach().item())
         running['accepted'] += int(output.decomposition_mask.sum().item())
-        running['refined'] += int(output.accept_mask.sum().item())
-        running['refine_score_rejected'] += int(output.stats['refinement_score_rejections'])
-        running['refine_norm_rejected'] += int(output.stats['residual_norm_rejections'])
+        running['feature_updated'] += int(output.feature_accept_mask.sum().item())
+        running['feature_score_rejected'] += int(
+            output.stats['feature_score_rejections']
+        )
+        running['feature_norm_rejected'] += int(
+            output.stats['feature_norm_rejections']
+        )
         running['candidates'] += int(output.candidate_mask.sum().item())
         running['steps'] += 1
 
@@ -1136,9 +1166,9 @@ def train_stage2_split_refiner(
             steps = max(running['steps'], 1)
             candidates = max(running['candidates'], 1)
             logger.info(
-                'Stage 2 Split-Refine Epoch {:02d} [{}/{}] loss {:.4f} '
-                'primitive {:.4f} refiner_primitive {:.4f} split {:.4f} feature {:.4f} '
-                'decomposition {:.2f}% refinement {:.2f}% rejected(score/norm) {}/{}'.format(
+                'Stage 2 Direct-Feature Epoch {:02d} [{}/{}] loss {:.4f} '
+                'primitive {:.4f} candidate_primitive {:.4f} split {:.4f} feature {:.4f} '
+                'decomposition {:.2f}% feature_update {:.2f}% rejected(score/norm) {}/{}'.format(
                     epoch,
                     batch_idx + 1,
                     len(train_loader),
@@ -1148,17 +1178,17 @@ def train_stage2_split_refiner(
                     running['split'] / steps,
                     running['feature'] / steps,
                     100.0 * running['accepted'] / candidates,
-                    100.0 * running['refined'] / candidates,
-                    running['refine_score_rejected'],
-                    running['refine_norm_rejected'],
+                    100.0 * running['feature_updated'] / candidates,
+                    running['feature_score_rejected'],
+                    running['feature_norm_rejected'],
                 )
             )
             for key in running:
                 running[key] = (
                     0.0
                     if key not in (
-                        'accepted', 'refined', 'refine_score_rejected',
-                        'refine_norm_rejected', 'candidates', 'steps',
+                        'accepted', 'feature_updated', 'feature_score_rejected',
+                        'feature_norm_rejected', 'candidates', 'steps',
                     )
                     else 0
                 )

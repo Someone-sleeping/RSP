@@ -9,7 +9,7 @@ from sklearn.utils.linear_assignment_ import linear_assignment  # pip install sc
 from sklearn.cluster import KMeans
 from models.fpn import Res16FPN18
 from models.res16unet import Res16UNet14
-from models.query_refiner import CandidateBasedRefiner
+from models.query_refiner import LegacyLogitResidualRefiner
 from models.unified_feature_model import (
     UnifiedBackboneFeatureModel,
     extract_backbone_state_dict,
@@ -124,7 +124,6 @@ def parse_args():
     parser.add_argument('--stage3_residual_scale', type=float, default=1.0)
     parser.add_argument('--stage2_split_refine_enable', action='store_true', default=False,
                         help='evaluate the integrated backbone-feature-context checkpoint')
-    parser.add_argument('--stage2_feature_residual_scale', type=float, default=0.1)
     parser.add_argument('--stage2_backbone_gradient_scale', type=float, default=0.1)
     parser.add_argument('--stage2_min_region_points', type=int, default=20)
     parser.add_argument('--stage2_min_child_points', type=int, default=8)
@@ -133,7 +132,8 @@ def parse_args():
     parser.add_argument('--stage2_entropy_th', type=float, default=0.25)
     parser.add_argument('--stage2_min_split_conf', type=float, default=0.35)
     parser.add_argument('--stage2_verifier_tolerance', type=float, default=0.0)
-    parser.add_argument('--stage2_max_residual_norm', type=float, default=1.0)
+    parser.add_argument('--stage2_max_feature_update_norm', '--stage2_max_residual_norm',
+                        dest='stage2_max_feature_update_norm', type=float, default=1.0)
     parser.add_argument('--stage2_min_structure_gain', type=float, default=0.01)
     parser.add_argument('--stage2_min_child_separation', type=float, default=0.05)
     parser.add_argument('--stage2_min_primitive_gain', type=float, default=0.005)
@@ -163,10 +163,10 @@ _STAGE2_EVAL_CONFIG_KEYS = (
     'input_dim', 'primitive_num', 'semantic_class', 'feats_dim',
     'conv1_kernel_size', 'voxel_size',
     'refine_hidden_dim', 'refine_num_heads', 'refine_dropout',
-    'stage2_feature_residual_scale', 'stage2_backbone_gradient_scale',
+    'stage2_backbone_gradient_scale',
     'stage2_min_region_points', 'stage2_min_child_points', 'stage2_max_regions',
     'stage2_purity_th', 'stage2_entropy_th', 'stage2_min_split_conf',
-    'stage2_verifier_tolerance', 'stage2_max_residual_norm',
+    'stage2_verifier_tolerance', 'stage2_max_feature_update_norm',
     'stage2_min_structure_gain', 'stage2_min_child_separation',
     'stage2_min_primitive_gain', 'stage2_min_primitive_margin',
     'stage2_primitive_top_k', 'stage2_primitive_support_tolerance',
@@ -185,6 +185,11 @@ def restore_stage2_eval_config(args):
     for key in _STAGE2_EVAL_CONFIG_KEYS:
         if key in saved_args:
             setattr(args, key, saved_args[key])
+    if (
+        'stage2_max_feature_update_norm' not in saved_args
+        and 'stage2_max_residual_norm' in saved_args
+    ):
+        args.stage2_max_feature_update_norm = saved_args['stage2_max_residual_norm']
 
 
 def resolve_eval_growsp(args, epoch):
@@ -438,8 +443,8 @@ def eval_once(args, model, test_loader, classifier, primitive_classifier=None, c
         "consistency_regions": 0,
         "changed_trusted_points": 0,
         "decomposition_accepted_regions": 0,
-        "refinement_accepted_regions": 0,
-        "refinement_rejected_regions": 0,
+        "feature_updates_accepted": 0,
+        "feature_updates_rejected": 0,
     }
     for data in test_loader:
         with torch.no_grad():
@@ -453,7 +458,7 @@ def eval_once(args, model, test_loader, classifier, primitive_classifier=None, c
             #
             if (
                 getattr(args, 'stage2_split_refine_enable', False)
-                and hasattr(model, 'refine_candidate_features')
+                and hasattr(model, 'update_candidate_features')
             ):
                 base_scores = F.linear(
                     F.normalize(feats), F.normalize(classifier.weight)
@@ -489,11 +494,11 @@ def eval_once(args, model, test_loader, classifier, primitive_classifier=None, c
                     primitive_classifier.weight if primitive_classifier is not None else None,
                     primitive_mapping,
                 )
-                refined_scores = F.linear(
-                    F.normalize(output.refined_features),
+                verified_scores = F.linear(
+                    F.normalize(output.verified_features),
                     F.normalize(classifier.weight),
                 )
-                preds = torch.argmax(refined_scores, dim=1).cpu()
+                preds = torch.argmax(verified_scores, dim=1).cpu()
                 changed = preds != base_preds
                 candidate_mask_cpu = output.candidate_mask.cpu()
                 stats["changed_points"] += int(changed.sum().item())
@@ -505,19 +510,19 @@ def eval_once(args, model, test_loader, classifier, primitive_classifier=None, c
                     (changed & candidate_mask_cpu).sum().item()
                 )
                 stats["accepted_points"] = stats.get("accepted_points", 0) + int(
-                    output.accept_mask.sum().item()
+                    output.feature_accept_mask.sum().item()
                 )
                 stats["rollback_points"] = stats.get("rollback_points", 0) + int(
-                    output.refinement_rollback_mask.sum().item()
+                    output.feature_rollback_mask.sum().item()
                 )
                 stats["decomposition_accepted_regions"] += int(
                     output.stats["accepted_splits"]
                 )
-                stats["refinement_accepted_regions"] += int(
-                    output.stats["refinement_accepted_splits"]
+                stats["feature_updates_accepted"] += int(
+                    output.stats["feature_updates_accepted"]
                 )
-                stats["refinement_rejected_regions"] += int(
-                    output.stats["refinement_rejected_splits"]
+                stats["feature_updates_rejected"] += int(
+                    output.stats["feature_updates_rejected"]
                 )
             elif refiner is not None and getattr(args, 'stage3_enable', False):
                 base_scores = F.linear(F.normalize(feats), F.normalize(classifier.weight))
@@ -666,7 +671,7 @@ def eval_once(args, model, test_loader, classifier, primitive_classifier=None, c
                     )
                 apply_mask = torch.ones_like(refine_mask) if getattr(args, 'refine_apply_all', False) else refine_mask
                 for _ in range(max(int(getattr(args, 'refine_rounds', 1)), 1)):
-                    delta_scores = refiner(
+                    legacy_logit_update = refiner(
                         feats,
                         point_coords,
                         point_batch_ids,
@@ -675,7 +680,10 @@ def eval_once(args, model, test_loader, classifier, primitive_classifier=None, c
                         use_region_branch=getattr(args, 'refine_region_branch', False),
                     )
                     if apply_mask.any():
-                        candidate_scores = scores + args.refine_residual_scale * delta_scores
+                        candidate_scores = (
+                            scores
+                            + args.refine_residual_scale * legacy_logit_update
+                        )
                         if getattr(args, 'refine_gate_enable', False):
                             base_probs = F.softmax(scores.detach(), dim=1)
                             candidate_probs = F.softmax(candidate_scores.detach(), dim=1)
@@ -786,10 +794,15 @@ def eval(epoch, args, test_areas = ['Area_5']):
     )
     model_state = _extract_checkpoint_state(model_checkpoint, 'model_state_dict')
     unified_checkpoint = any(
-        key.startswith('feature_context.') for key in model_state
+        key.startswith('feature_refiner.') or key.startswith('feature_context.')
+        for key in model_state
     )
     if unified_checkpoint:
         args.stage2_split_refine_enable = True
+        # A unified checkpoint uses direct feature updates exclusively. Legacy
+        # semantic-logit residual modules are separate archived experiments.
+        args.refine_enable = False
+        args.stage3_enable = False
         restore_stage2_eval_config(args)
         args.stage2_eval_growsp = resolve_eval_growsp(args, epoch)
 
@@ -804,7 +817,7 @@ def eval(epoch, args, test_areas = ['Area_5']):
         )
         model.load_state_dict(model_state)
         print(
-            'Loaded unified feature-context model; inference GrowSP target {}.'.format(
+            'Loaded unified direct-feature model; inference GrowSP target {}.'.format(
                 args.stage2_eval_growsp
             )
         )
@@ -845,7 +858,7 @@ def eval(epoch, args, test_areas = ['Area_5']):
         if not os.path.exists(refiner_path):
             refiner_path = os.path.join(args.save_path, 'ckpts', 'refiner_' + str(epoch) + '_checkpoint.pth')
         if os.path.exists(refiner_path):
-            refiner = CandidateBasedRefiner(
+            refiner = LegacyLogitResidualRefiner(
                 feat_dim=args.feats_dim,
                 num_classes=args.semantic_class,
                 hidden_dim=getattr(args, 'refine_hidden_dim', 128),
@@ -940,11 +953,11 @@ if __name__ == '__main__':
         )
         if getattr(args, 'stage2_split_refine_enable', False):
             print(
-                'Unified feature context: decomposition accepted {}, refinement '
+                'Direct feature model: decomposition accepted {}, feature updates '
                 'accepted {}, rejected {}, accepted points {}.'.format(
                     stats.get('decomposition_accepted_regions', 0),
-                    stats.get('refinement_accepted_regions', 0),
-                    stats.get('refinement_rejected_regions', 0),
+                    stats.get('feature_updates_accepted', 0),
+                    stats.get('feature_updates_rejected', 0),
                     stats.get('accepted_points', 0),
                 )
             )

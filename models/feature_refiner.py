@@ -2,14 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.query_refiner import CandidateBasedRefiner
-
-
-class CandidateFeatureContextBlock(nn.Module):
-    """Query-conditioned context layer that returns updated point features.
+class CandidateFeatureRefiner(nn.Module):
+    """Query-conditioned module that directly returns updated point features.
 
     The block reads the complete scene, but writes only candidate points. Its
-    output is a feature representation rather than a semantic-logit residual.
+    output is the feature representation consumed by GrowSP classification and
+    superpoint aggregation; it has no semantic-logit output head.
     Identity initialization lets an existing backbone checkpoint adopt the
     layer without changing its initial predictions.
     """
@@ -37,18 +35,60 @@ class CandidateFeatureContextBlock(nn.Module):
             nn.Linear(hidden_dim * 2, hidden_dim),
         )
         self.output_norm = nn.LayerNorm(hidden_dim)
-        self.context_to_feature = nn.Linear(hidden_dim, feat_dim)
-        self.local_feature = nn.Linear(feat_dim, feat_dim)
-        self.gate = nn.Linear(hidden_dim, 1)
+        self.feature_projection = nn.Linear(feat_dim + hidden_dim, feat_dim)
         self._identity_initialize(feat_dim)
 
     def _identity_initialize(self, feat_dim):
-        nn.init.zeros_(self.context_to_feature.weight)
-        nn.init.zeros_(self.context_to_feature.bias)
-        nn.init.eye_(self.local_feature.weight)
-        nn.init.zeros_(self.local_feature.bias)
-        nn.init.zeros_(self.gate.weight)
-        nn.init.constant_(self.gate.bias, -2.0)
+        # Start from the backbone representation while leaving the contextual
+        # columns trainable from the first optimization step.
+        nn.init.zeros_(self.feature_projection.weight)
+        nn.init.eye_(self.feature_projection.weight[:, :feat_dim])
+        nn.init.zeros_(self.feature_projection.bias)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Migrate the first direct-feature checkpoint layout when possible."""
+        projection_key = prefix + "feature_projection.weight"
+        local_key = prefix + "local_feature.weight"
+        context_key = prefix + "context_to_feature.weight"
+        if projection_key not in state_dict and (
+            local_key in state_dict or context_key in state_dict
+        ):
+            projection = self.feature_projection.weight.detach().clone()
+            feat_dim = self.feature_projection.out_features
+            if local_key in state_dict:
+                projection[:, :feat_dim] = state_dict.pop(local_key)
+            if context_key in state_dict:
+                projection[:, feat_dim:] = state_dict.pop(context_key)
+            state_dict[projection_key] = projection
+            local_bias = state_dict.pop(prefix + "local_feature.bias", None)
+            context_bias = state_dict.pop(prefix + "context_to_feature.bias", None)
+            if prefix + "feature_projection.bias" not in state_dict:
+                bias = self.feature_projection.bias.detach().clone()
+                if local_bias is not None:
+                    bias.add_(local_bias)
+                if context_bias is not None:
+                    bias.add_(context_bias)
+                state_dict[prefix + "feature_projection.bias"] = bias
+            state_dict.pop(prefix + "gate.weight", None)
+            state_dict.pop(prefix + "gate.bias", None)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     @staticmethod
     def _scaled_backbone_features(point_features, gradient_scale):
@@ -85,9 +125,9 @@ class CandidateFeatureContextBlock(nn.Module):
         context_input = torch.where(
             candidate_mask[:, None], base_features, point_features.detach()
         )
-        refined_features = base_features.clone()
+        updated_features = base_features.clone()
         if query_indices.numel() == 0 or not candidate_mask.any():
-            return F.normalize(refined_features, dim=1)
+            return F.normalize(updated_features, dim=1)
 
         for batch_id in torch.unique(batch_ids):
             scene_mask = batch_ids == batch_id
@@ -134,73 +174,24 @@ class CandidateFeatureContextBlock(nn.Module):
             scene_tokens = scene_tokens + self.ffn(scene_tokens)
             normalized_tokens = self.output_norm(scene_tokens)
 
-            proposal = F.normalize(
-                self.local_feature(base_features[scene_indices])
-                + self.context_to_feature(normalized_tokens),
-                dim=1,
-            )
-            blend = torch.sigmoid(self.gate(normalized_tokens))
-            scene_refined = F.normalize(
-                (1.0 - blend) * base_features[scene_indices] + blend * proposal,
+            # The head predicts the candidate representation itself. It does
+            # not emit class logits or an additive feature residual.
+            scene_updated = F.normalize(
+                self.feature_projection(
+                    torch.cat(
+                        (base_features[scene_indices], normalized_tokens), dim=1
+                    )
+                ),
                 dim=1,
             )
             scene_candidates = candidate_mask[scene_indices]
-            refined_features[scene_indices[scene_candidates]] = scene_refined[
+            updated_features[scene_indices[scene_candidates]] = scene_updated[
                 scene_candidates
             ]
 
-        return F.normalize(refined_features, dim=1)
+        return F.normalize(updated_features, dim=1)
 
 
-class CandidateFeatureRefiner(CandidateBasedRefiner):
-    """Contextual residual adapter operating in backbone feature space."""
-
-    def __init__(self, feat_dim, hidden_dim=128, num_heads=4, dropout=0.0):
-        super().__init__(
-            feat_dim=feat_dim,
-            num_classes=feat_dim,
-            hidden_dim=hidden_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-        )
-
-    def refine(
-        self,
-        point_features,
-        coordinates,
-        batch_ids,
-        query_indices,
-        candidate_mask,
-        regions=None,
-        residual_scale=0.1,
-        backbone_gradient_scale=0.1,
-    ):
-        candidate_mask = candidate_mask.to(
-            device=point_features.device, dtype=point_features.dtype
-        ).view(-1, 1)
-        # Candidate losses may update their backbone features. Scene context is
-        # still readable, but detached non-candidate tokens prevent a local proxy
-        # from rewriting unrelated backbone features through attention.
-        scaled_features = (
-            point_features.detach()
-            + float(backbone_gradient_scale)
-            * (point_features - point_features.detach())
-        )
-        refiner_input = (
-            candidate_mask * scaled_features
-            + (1.0 - candidate_mask) * point_features.detach()
-        )
-        residual = self(
-            refiner_input,
-            coordinates,
-            batch_ids,
-            query_indices,
-            regions=regions,
-            candidate_mask=candidate_mask.bool().view(-1),
-            pool_query_regions=True,
-        )
-        refined = F.normalize(
-            scaled_features + float(residual_scale) * residual,
-            dim=1,
-        )
-        return refined, residual
+# Compatibility for source files archived with the first unified checkpoint.
+# Both names refer to the same direct feature-output implementation.
+CandidateFeatureContextBlock = CandidateFeatureRefiner

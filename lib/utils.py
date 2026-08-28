@@ -35,13 +35,13 @@ def get_sp_feature(
         'proposed_splits': 0,
         'accepted_splits': 0,
         'rejected_splits': 0,
-        'refinement_accepted_splits': 0,
-        'refinement_rejected_splits': 0,
-        'refinement_score_rejections': 0,
-        'residual_norm_rejections': 0,
+        'feature_updates_accepted': 0,
+        'feature_updates_rejected': 0,
+        'feature_score_rejections': 0,
+        'feature_norm_rejections': 0,
         'primitive_rejections': 0,
         'supervised_points': 0,
-        'refined_points': 0,
+        'feature_updated_points': 0,
         'valid_points': 0,
     }
     if superpoint_module is not None:
@@ -55,7 +55,7 @@ def get_sp_feature(
             gt = labels.clone()
             raw_region = region.clone()
             grown_region_for_training = None
-            split_override_data = None
+            split_commit_data = None
 
             in_field = ME.TensorField(features, coords, device=0)
 
@@ -100,30 +100,39 @@ def get_sp_feature(
                     min_semantic_separation=getattr(args, 'learnable_sp_semantic_sep', 0.15),
                 )
                 region = structure_output.dynamic_regions.cpu()
-                if hasattr(structure_output, 'refined_features'):
+                if hasattr(structure_output, 'verified_features'):
+                    feats = structure_output.verified_features
+                elif hasattr(structure_output, 'refined_features'):
                     feats = structure_output.refined_features
                 structure_stats['scenes'] += 1
                 structure_stats['candidate_regions'] += structure_output.stats['selected_regions']
                 structure_stats['proposed_splits'] += structure_output.stats.get('proposed_splits', 0)
                 structure_stats['accepted_splits'] += structure_output.stats['accepted_splits']
                 structure_stats['rejected_splits'] += structure_output.stats.get('rejected_splits', 0)
-                structure_stats['refinement_accepted_splits'] += structure_output.stats.get(
-                    'refinement_accepted_splits', 0
+                structure_stats['feature_updates_accepted'] += structure_output.stats.get(
+                    'feature_updates_accepted',
+                    structure_output.stats.get('refinement_accepted_splits', 0),
                 )
-                structure_stats['refinement_rejected_splits'] += structure_output.stats.get(
-                    'refinement_rejected_splits', 0
+                structure_stats['feature_updates_rejected'] += structure_output.stats.get(
+                    'feature_updates_rejected',
+                    structure_output.stats.get('refinement_rejected_splits', 0),
                 )
-                structure_stats['refinement_score_rejections'] += structure_output.stats.get(
-                    'refinement_score_rejections', 0
+                structure_stats['feature_score_rejections'] += structure_output.stats.get(
+                    'feature_score_rejections',
+                    structure_output.stats.get('refinement_score_rejections', 0),
                 )
-                structure_stats['residual_norm_rejections'] += structure_output.stats.get(
-                    'residual_norm_rejections', 0
+                structure_stats['feature_norm_rejections'] += structure_output.stats.get(
+                    'feature_norm_rejections',
+                    structure_output.stats.get('residual_norm_rejections', 0),
                 )
                 structure_stats['primitive_rejections'] += structure_output.stats.get(
                     'primitive_rejections', 0
                 )
                 structure_stats['supervised_points'] += int(structure_output.supervision_mask.sum().item())
-                structure_stats['refined_points'] += int(structure_output.accept_mask.sum().item())
+                accepted_mask = getattr(structure_output, 'feature_accept_mask', None)
+                if accepted_mask is None:
+                    accepted_mask = structure_output.accept_mask
+                structure_stats['feature_updated_points'] += int(accepted_mask.sum().item())
                 structure_stats['valid_points'] += int(region.numel())
             ##
             region_num = len(torch.unique(region))
@@ -175,12 +184,13 @@ def get_sp_feature(
                         neural_region.size(0), dtype=torch.long, device=feats.device
                     ),
                 )
-                # Keep merged parent regions in the global primitive KMeans.
-                # Verified children are assigned to the resulting primitives
-                # afterwards, so a local split cannot perturb every centroid.
-                split_override_data = {
-                    'dynamic_regions': structure_output.dynamic_regions.cpu(),
-                    'refined_features': structure_output.refined_features.cpu(),
+                # Verified features and decomposed regions become the actual
+                # inputs to superpoint aggregation and primitive clustering.
+                feats = structure_output.verified_features
+                neural_region = structure_output.dynamic_regions.cpu()
+                split_commit_data = {
+                    'dynamic_regions': neural_region,
+                    'verified_features': structure_output.verified_features.cpu(),
                     'accept_mask': structure_output.decomposition_mask.cpu(),
                 }
                 structure_stats['scenes'] += 1
@@ -188,23 +198,25 @@ def get_sp_feature(
                 structure_stats['proposed_splits'] += structure_output.stats.get('proposed_splits', 0)
                 structure_stats['accepted_splits'] += structure_output.stats['accepted_splits']
                 structure_stats['rejected_splits'] += structure_output.stats.get('rejected_splits', 0)
-                structure_stats['refinement_accepted_splits'] += structure_output.stats.get(
-                    'refinement_accepted_splits', 0
+                structure_stats['feature_updates_accepted'] += structure_output.stats.get(
+                    'feature_updates_accepted', 0
                 )
-                structure_stats['refinement_rejected_splits'] += structure_output.stats.get(
-                    'refinement_rejected_splits', 0
+                structure_stats['feature_updates_rejected'] += structure_output.stats.get(
+                    'feature_updates_rejected', 0
                 )
-                structure_stats['refinement_score_rejections'] += structure_output.stats.get(
-                    'refinement_score_rejections', 0
+                structure_stats['feature_score_rejections'] += structure_output.stats.get(
+                    'feature_score_rejections', 0
                 )
-                structure_stats['residual_norm_rejections'] += structure_output.stats.get(
-                    'residual_norm_rejections', 0
+                structure_stats['feature_norm_rejections'] += structure_output.stats.get(
+                    'feature_norm_rejections', 0
                 )
                 structure_stats['primitive_rejections'] += structure_output.stats.get(
                     'primitive_rejections', 0
                 )
                 structure_stats['supervised_points'] += int(structure_output.supervision_mask.sum().item())
-                structure_stats['refined_points'] += int(structure_output.accept_mask.sum().item())
+                structure_stats['feature_updated_points'] += int(
+                    structure_output.feature_accept_mask.sum().item()
+                )
                 structure_stats['valid_points'] += int(neural_region.numel())
             pfh = []
 
@@ -272,7 +284,7 @@ def get_sp_feature(
             if vis:
                 context.append((
                     scene_name, gt, raw_region, grown_region_for_training,
-                    coords, inverse_map, split_override_data,
+                    coords, inverse_map, split_commit_data,
                 ))
                 vis_path = '/home/magic/magic/cm/repositories/GrowSP/data/S3DIS/sp_vis'
                 vis_pool.submit_task(coords, scene_name, valid_mask, inverse_map, neural_region.numpy(), vis_path)
@@ -280,7 +292,7 @@ def get_sp_feature(
             else:
                 context.append((
                     scene_name, gt, raw_region, grown_region_for_training,
-                    split_override_data,
+                    split_commit_data,
                 ))
 
             torch.cuda.empty_cache()
@@ -382,56 +394,7 @@ def get_kittisp_feature(args, loader, model, current_growsp):
 
 
 
-def build_split_primitive_overrides(
-    context,
-    primitive_centers,
-    primitive_labels,
-    all_sp_index,
-    min_gain=0.05,
-    min_margin=0.02,
-):
-    """Assign verified child regions without changing the global KMeans fit."""
-    primitive_centers = F.normalize(primitive_centers.detach().cpu(), dim=1)
-    overrides = []
-    region_offset = 0
-    stats = {'children': 0, 'points': 0, 'valid_points': 0}
-    for scene_idx, item in enumerate(context):
-        split_data = next((value for value in reversed(item) if isinstance(value, dict)), None)
-        scene_regions = all_sp_index[scene_idx].long()
-        global_regions = scene_regions + region_offset
-        parent_primitives = torch.from_numpy(primitive_labels[global_regions.numpy()]).long()
-        region_offset += int(torch.unique(scene_regions).numel())
-        stats['valid_points'] += int(scene_regions.numel())
-        if not split_data:
-            overrides.append(None)
-            continue
-        dynamic_regions = split_data['dynamic_regions'].long()
-        refined_features = F.normalize(split_data['refined_features'].float(), dim=1)
-        accept_mask = split_data['accept_mask'].bool()
-        point_override = torch.full_like(dynamic_regions, -1)
-        for child_id in torch.unique(dynamic_regions[accept_mask]):
-            child_mask = accept_mask & (dynamic_regions == child_id)
-            child_center = F.normalize(
-                refined_features[child_mask].mean(dim=0, keepdim=True), dim=1
-            )
-            scores = F.linear(child_center, primitive_centers).squeeze(0)
-            top_scores, top_ids = scores.topk(k=min(2, scores.numel()))
-            parent_id = torch.mode(parent_primitives[child_mask]).values
-            gain = top_scores[0] - scores[parent_id]
-            margin = top_scores[0] - top_scores[-1]
-            if (
-                top_ids[0] != parent_id
-                and gain >= float(min_gain)
-                and margin >= float(min_margin)
-            ):
-                point_override[child_mask] = top_ids[0].item()
-                stats['children'] += 1
-                stats['points'] += int(child_mask.sum().item())
-        overrides.append(point_override.numpy())
-    return overrides, stats
-
-
-def get_pseudo(args, context, cluster_pred, all_sp_index=None, primitive_overrides=None):
+def get_pseudo(args, context, cluster_pred, all_sp_index=None):
     print('computing pseduo labels...')
     pseudo_label_folder = args.pseudo_label_path + '/'
     if not os.path.exists(pseudo_label_folder):
@@ -459,10 +422,6 @@ def get_pseudo(args, context, cluster_pred, all_sp_index=None, primitive_overrid
 
         pseudo = -np.ones_like(labels.numpy()).astype(np.int32)
         point_pseudo = cluster_pred[sub_cluster_pred].copy()
-        if primitive_overrides is not None and primitive_overrides[i] is not None:
-            override = primitive_overrides[i]
-            override_mask = override >= 0
-            point_pseudo[override_mask] = override[override_mask]
         pseudo[valid_mask] = point_pseudo
         scene_sp_gt = []
         for local_sp_id in np.unique(region_tmp):

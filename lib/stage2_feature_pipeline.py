@@ -8,11 +8,8 @@ from lib.stage3_pipeline import Stage3Config, reindex_split_regions, split_super
 
 @dataclass
 class Stage2FeatureConfig:
-    """Split-and-grow feature refinement used during GrowSP Stage 2."""
+    """Grow-then-decompose direct feature updates used during Stage 2."""
 
-    # Kept for loading old experiment arguments. The unified context layer
-    # outputs features directly and does not scale an external residual.
-    residual_scale: float = 0.1
     backbone_gradient_scale: float = 0.1
     query_scale: float = 10.0
     min_region_points: int = 20
@@ -22,7 +19,7 @@ class Stage2FeatureConfig:
     entropy_threshold: float = 0.25
     min_split_confidence: float = 0.35
     verifier_tolerance: float = 0.0
-    max_residual_norm: float = 1.0
+    max_feature_update_norm: float = 1.0
     min_structure_gain: float = 0.01
     min_child_separation: float = 0.05
     min_primitive_gain: float = 0.005
@@ -35,7 +32,6 @@ class Stage2FeatureConfig:
     def from_args(cls, args):
         """Build one shared configuration for training, clustering and eval."""
         return cls(
-            residual_scale=getattr(args, "stage2_feature_residual_scale", 0.1),
             backbone_gradient_scale=getattr(
                 args, "stage2_backbone_gradient_scale", 0.1
             ),
@@ -46,7 +42,9 @@ class Stage2FeatureConfig:
             entropy_threshold=getattr(args, "stage2_entropy_th", 0.25),
             min_split_confidence=getattr(args, "stage2_min_split_conf", 0.35),
             verifier_tolerance=getattr(args, "stage2_verifier_tolerance", 0.0),
-            max_residual_norm=getattr(args, "stage2_max_residual_norm", 1.0),
+            max_feature_update_norm=getattr(
+                args, "stage2_max_feature_update_norm", 1.0
+            ),
             min_structure_gain=getattr(args, "stage2_min_structure_gain", 0.01),
             min_child_separation=getattr(
                 args, "stage2_min_child_separation", 0.05
@@ -76,18 +74,18 @@ class Stage2FeatureConfig:
 @dataclass
 class Stage2FeatureOutput:
     base_features: torch.Tensor
-    proposed_features: torch.Tensor
-    refined_features: torch.Tensor
-    residual_features: torch.Tensor
+    candidate_features: torch.Tensor
+    verified_features: torch.Tensor
+    feature_update: torch.Tensor
     dynamic_regions: torch.Tensor
     supervision_targets: torch.Tensor
     supervision_confidence: torch.Tensor
     supervision_mask: torch.Tensor
     candidate_mask: torch.Tensor
     decomposition_mask: torch.Tensor
-    accept_mask: torch.Tensor
+    feature_accept_mask: torch.Tensor
     rollback_mask: torch.Tensor
-    refinement_rollback_mask: torch.Tensor
+    feature_rollback_mask: torch.Tensor
     query_indices: torch.Tensor
     original_regions: torch.Tensor
     batch_ids: torch.Tensor
@@ -191,11 +189,11 @@ def _primitive_partition_is_consistent(
     )
 
 
-def _verify_feature_splits(
+def _verify_feature_updates(
     config,
     base_features,
-    proposed_features,
-    residual,
+    candidate_features,
+    feature_update,
     split,
     regions,
     batch_ids,
@@ -204,15 +202,15 @@ def _verify_feature_splits(
 ):
     accepted_targets = split.targets.clone()
     decomposition_mask = torch.zeros_like(split.candidate_mask)
-    refinement_accept_mask = torch.zeros_like(split.candidate_mask)
+    feature_accept_mask = torch.zeros_like(split.candidate_mask)
     rollback_mask = torch.zeros_like(split.candidate_mask)
-    refinement_rollback_mask = torch.zeros_like(split.candidate_mask)
+    feature_rollback_mask = torch.zeros_like(split.candidate_mask)
     accepted_regions = 0
     rejected_regions = 0
-    refinement_accepted_regions = 0
-    refinement_rejected_regions = 0
-    refinement_score_rejections = 0
-    residual_norm_rejections = 0
+    feature_accepted_regions = 0
+    feature_rejected_regions = 0
+    feature_score_rejections = 0
+    feature_norm_rejections = 0
     primitive_rejections = 0
     regions = regions.view(-1).long().to(base_features.device)
     batch_ids = batch_ids.view(-1).long().to(base_features.device)
@@ -232,10 +230,10 @@ def _verify_feature_splits(
             parent_compactness, child_compactness, child_separation = _partition_statistics(
                 base_features.detach(), parent_mask, split.targets
             )
-            refined_score = _child_structure_score(
-                proposed_features.detach(), parent_mask, split.targets, config.separation_weight
+            candidate_score = _child_structure_score(
+                candidate_features.detach(), parent_mask, split.targets, config.separation_weight
             )
-            applied_residual_norm = residual.detach()[candidate].norm(dim=1).mean()
+            update_norm = feature_update.detach()[candidate].norm(dim=1).mean()
             primitive_consistent = _primitive_partition_is_consistent(
                 config,
                 base_features.detach(),
@@ -253,18 +251,19 @@ def _verify_feature_splits(
                 decomposition_mask[candidate] = True
                 accepted_regions += 1
                 score_accepted = (
-                    refined_score + float(config.verifier_tolerance) + 1e-6 >= base_score
+                    candidate_score + float(config.verifier_tolerance) + 1e-6
+                    >= base_score
                 )
-                norm_accepted = applied_residual_norm <= float(config.max_residual_norm)
-                refinement_accepted = score_accepted and norm_accepted
-                if refinement_accepted:
-                    refinement_accept_mask[candidate] = True
-                    refinement_accepted_regions += 1
+                norm_accepted = update_norm <= float(config.max_feature_update_norm)
+                feature_accepted = score_accepted and norm_accepted
+                if feature_accepted:
+                    feature_accept_mask[candidate] = True
+                    feature_accepted_regions += 1
                 else:
-                    refinement_score_rejections += int(not score_accepted)
-                    residual_norm_rejections += int(not norm_accepted)
-                    refinement_rollback_mask[candidate] = True
-                    refinement_rejected_regions += 1
+                    feature_score_rejections += int(not score_accepted)
+                    feature_norm_rejections += int(not norm_accepted)
+                    feature_rollback_mask[candidate] = True
+                    feature_rejected_regions += 1
             else:
                 primitive_rejections += int(not primitive_consistent)
                 rollback_mask[candidate] = True
@@ -274,15 +273,15 @@ def _verify_feature_splits(
     return (
         accepted_targets,
         decomposition_mask,
-        refinement_accept_mask,
+        feature_accept_mask,
         rollback_mask,
-        refinement_rollback_mask,
+        feature_rollback_mask,
         accepted_regions,
         rejected_regions,
-        refinement_accepted_regions,
-        refinement_rejected_regions,
-        refinement_score_rejections,
-        residual_norm_rejections,
+        feature_accepted_regions,
+        feature_rejected_regions,
+        feature_score_rejections,
+        feature_norm_rejections,
         primitive_rejections,
     )
 
@@ -299,7 +298,7 @@ def run_stage2_feature_pipeline(
     primitive_centers=None,
     primitive_to_semantic=None,
 ):
-    """Refine candidate features and commit only structurally safe updates."""
+    """Update candidate features and commit only structurally safe features."""
     # Training already supplies normalized embeddings, while clustering obtains
     # raw backbone activations. A shared scale is required for verifier update
     # norms and prevents normalization itself from looking like a correction.
@@ -317,57 +316,49 @@ def run_stage2_feature_pipeline(
         regions,
         batch_ids,
     )
-    if hasattr(feature_refiner, "refine_candidate_features"):
-        proposed_features, _ = feature_refiner.refine_candidate_features(
-            point_features,
-            coordinates,
-            batch_ids,
-            split.query_indices,
-            split.candidate_mask,
-            regions=split.dynamic_regions,
-            backbone_gradient_scale=config.backbone_gradient_scale,
+    if not hasattr(feature_refiner, "update_candidate_features"):
+        raise TypeError(
+            "Stage-2 requires a direct feature model with "
+            "update_candidate_features()."
         )
-    else:
-        # Compatibility path for archived external residual adapters.
-        proposed_features, _ = feature_refiner.refine(
-            point_features,
-            coordinates,
-            batch_ids,
-            split.query_indices,
-            split.candidate_mask,
-            regions=split.dynamic_regions,
-            residual_scale=config.residual_scale,
-            backbone_gradient_scale=config.backbone_gradient_scale,
-        )
-    # Verification and regularization use the actual feature displacement,
-    # independent of how a model parameterizes its internal context update.
-    residual = proposed_features - point_features
+    candidate_features = feature_refiner.update_candidate_features(
+        point_features,
+        coordinates,
+        batch_ids,
+        split.query_indices,
+        split.candidate_mask,
+        regions=split.dynamic_regions,
+        backbone_gradient_scale=config.backbone_gradient_scale,
+    )
+    # This displacement is only a verifier/regularizer measurement. The model
+    # predicts candidate features directly, never semantic-logit deltas.
+    feature_update = candidate_features - point_features
     (
         targets,
         decomposition_mask,
-        refinement_accept_mask,
+        feature_accept_mask,
         rollback_mask,
-        refinement_rollback_mask,
+        feature_rollback_mask,
         accepted,
         rejected,
-        refinement_accepted,
-        refinement_rejected,
-        refinement_score_rejections,
-        residual_norm_rejections,
+        feature_accepted,
+        feature_rejected,
+        feature_score_rejections,
+        feature_norm_rejections,
         primitive_rejections,
-    ) = _verify_feature_splits(
+    ) = _verify_feature_updates(
         config,
         discovery_features,
-        proposed_features,
-        residual,
+        candidate_features,
+        feature_update,
         split,
         regions,
         batch_ids,
         primitive_centers,
         primitive_to_semantic,
     )
-    refined_features = point_features.clone()
-    refined_features[refinement_accept_mask] = proposed_features[refinement_accept_mask]
+    verified_features = point_features.clone()
+    verified_features[feature_accept_mask] = candidate_features[feature_accept_mask]
     dynamic_regions = reindex_split_regions(regions, batch_ids, targets)
     confidence = torch.zeros_like(split.target_confidence)
     confidence[decomposition_mask] = split.target_confidence[decomposition_mask]
@@ -376,28 +367,28 @@ def run_stage2_feature_pipeline(
         "proposed_splits": split.statistics["split_regions"],
         "accepted_splits": accepted,
         "rejected_splits": rejected,
-        "refinement_accepted_splits": refinement_accepted,
-        "refinement_rejected_splits": refinement_rejected,
-        "refinement_score_rejections": refinement_score_rejections,
-        "residual_norm_rejections": residual_norm_rejections,
+        "feature_updates_accepted": feature_accepted,
+        "feature_updates_rejected": feature_rejected,
+        "feature_score_rejections": feature_score_rejections,
+        "feature_norm_rejections": feature_norm_rejections,
         "primitive_rejections": primitive_rejections,
         "supervised_ratio": float(decomposition_mask.float().mean().item()),
-        "refined_ratio": float(refinement_accept_mask.float().mean().item()),
+        "feature_update_ratio": float(feature_accept_mask.float().mean().item()),
     }
     return Stage2FeatureOutput(
         base_features=point_features,
-        proposed_features=proposed_features,
-        refined_features=refined_features,
-        residual_features=residual,
+        candidate_features=candidate_features,
+        verified_features=verified_features,
+        feature_update=feature_update,
         dynamic_regions=dynamic_regions,
         supervision_targets=targets,
         supervision_confidence=confidence,
         supervision_mask=decomposition_mask,
         candidate_mask=split.candidate_mask,
         decomposition_mask=decomposition_mask,
-        accept_mask=refinement_accept_mask,
+        feature_accept_mask=feature_accept_mask,
         rollback_mask=rollback_mask,
-        refinement_rollback_mask=refinement_rollback_mask,
+        feature_rollback_mask=feature_rollback_mask,
         query_indices=split.query_indices,
         original_regions=regions.view(-1).long(),
         batch_ids=batch_ids.view(-1).long(),
@@ -414,12 +405,14 @@ def stage2_feature_losses(
 ):
     """Feature-space objectives for accepted child regions."""
     # A candidate feature update contributes gradients only after verification.
-    # Accepted decomposition without accepted refinement can still alter the
+    # Accepted decomposition without an accepted feature update can still alter the
     # region structure, but cannot train an unsupported feature transformation.
-    mask = output.accept_mask
-    zero = output.refined_features.sum() * 0.0
+    mask = output.feature_accept_mask
+    zero = output.verified_features.sum() * 0.0
     if mask.any():
-        logits = F.linear(F.normalize(output.refined_features[mask], dim=1), semantic_centers)
+        logits = F.linear(
+            F.normalize(output.verified_features[mask], dim=1), semantic_centers
+        )
         point_loss = F.cross_entropy(
             logits * semantic_scale,
             output.supervision_targets[mask],
@@ -433,10 +426,10 @@ def stage2_feature_losses(
     primitive_loss = zero
     if mask.any() and primitive_centers is not None and primitive_to_semantic is not None:
         primitive_centers = F.normalize(
-            primitive_centers.detach().to(output.proposed_features.device), dim=1
+            primitive_centers.detach().to(output.candidate_features.device), dim=1
         )
         primitive_to_semantic = primitive_to_semantic.detach().long().to(
-            output.proposed_features.device
+            output.candidate_features.device
         )
         base_scores = F.linear(
             F.normalize(output.base_features.detach()[mask], dim=1), primitive_centers
@@ -455,7 +448,7 @@ def stage2_feature_losses(
         valid_primitive = primitive_targets >= 0
         if valid_primitive.any():
             primitive_logits = F.linear(
-                F.normalize(output.refined_features[mask][valid_primitive], dim=1),
+                F.normalize(output.verified_features[mask][valid_primitive], dim=1),
                 primitive_centers,
             )
             point_loss = F.cross_entropy(
@@ -475,15 +468,15 @@ def stage2_feature_losses(
                 continue
             structure_terms.append(
                 -_child_structure_score(
-                    output.refined_features,
+                    output.verified_features,
                     parent_mask,
                     output.supervision_targets,
                     separation_weight=0.25,
                 )
             )
     structure_loss = torch.stack(structure_terms).mean() if structure_terms else zero
-    residual_loss = (
-        output.residual_features[mask].pow(2).mean()
+    feature_update_loss = (
+        output.feature_update[mask].pow(2).mean()
         if mask.any()
         else zero
     )
@@ -491,14 +484,15 @@ def stage2_feature_losses(
         "semantic": semantic_loss,
         "primitive": primitive_loss,
         "structure": structure_loss,
-        "residual": residual_loss,
+        "feature_update": feature_update_loss,
     }
 
 
 class Stage2FeatureModule:
-    """Shared adapter for Stage-2 training-time and clustering-time refinement."""
+    """Run the same integrated Stage-2 feature path in training and clustering."""
 
     apply_after_grow = True
+    commits_dynamic_regions = True
 
     def __init__(self, feature_refiner, config):
         self.feature_refiner = feature_refiner
