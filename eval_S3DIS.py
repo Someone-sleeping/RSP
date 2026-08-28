@@ -8,6 +8,7 @@ from sklearn.utils.linear_assignment_ import linear_assignment  # pip install sc
 from sklearn.cluster import KMeans
 from models.fpn import Res16FPN18
 from models.query_refiner import CandidateBasedRefiner
+from models.unified_feature_model import extract_backbone_state_dict
 from lib.error_query import build_error_queries
 from lib.split_regions import build_region_consistency_queries, build_split_region_queries, build_uncertain_region_queries
 from lib.stage3_pipeline import Stage3Config, run_stage3_pipeline
@@ -529,7 +530,11 @@ def compute_unsupervised_metrics(all_preds, all_labels, sem_num):
 def eval(epoch, args, test_areas = ['Area_5']):
 
     model = Res16FPN18(in_channels=args.input_dim, out_channels=args.primitive_num, conv1_kernel_size=args.conv1_kernel_size, config=args).cuda()
-    model.load_state_dict(torch.load(os.path.join(args.save_path, 'model_' + str(epoch) + '_checkpoint.pth')))
+    model_state = torch.load(
+        os.path.join(args.save_path, 'model_' + str(epoch) + '_checkpoint.pth'),
+        map_location='cpu',
+    )
+    model.load_state_dict(extract_backbone_state_dict(model_state))
     model.eval()
 
     cls = torch.nn.Linear(args.feats_dim, args.primitive_num, bias=False).cuda()

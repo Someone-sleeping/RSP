@@ -13,7 +13,8 @@ from lib.stage2_feature_pipeline import (
 )
 from lib.my_utils import load_resume_checkpoint
 from lib.utils import build_split_primitive_overrides, get_pseudo
-from models.feature_refiner import CandidateFeatureRefiner
+from models.feature_refiner import CandidateFeatureContextBlock, CandidateFeatureRefiner
+from models.unified_feature_model import UnifiedBackboneFeatureModel
 
 
 def _mixed_region():
@@ -103,6 +104,46 @@ def test_feature_refiner_reads_but_does_not_backpropagate_to_non_candidates():
     assert torch.equal(
         features.grad[~candidate_mask], torch.zeros_like(features.grad[~candidate_mask])
     )
+
+
+def test_direct_feature_context_is_identity_initialized_and_trainable():
+    torch.manual_seed(0)
+    features = F.normalize(torch.randn(6, 4), dim=1).requires_grad_()
+    coordinates = torch.randn(6, 3)
+    batch_ids = torch.zeros(6, dtype=torch.long)
+    regions = torch.tensor([0, 0, 1, 1, 2, 2])
+    candidate_mask = torch.tensor([True, True, False, False, False, False])
+    context = CandidateFeatureContextBlock(4, hidden_dim=8, num_heads=2)
+
+    refined = context(
+        features,
+        coordinates,
+        batch_ids,
+        torch.tensor([0]),
+        candidate_mask,
+        regions=regions,
+    )
+
+    assert torch.allclose(refined, features, atol=1e-6)
+    refined[candidate_mask, 0].sum().backward()
+    assert context.context_to_feature.weight.grad is not None
+    assert context.context_to_feature.weight.grad.abs().sum() > 0
+    assert torch.equal(
+        features.grad[~candidate_mask], torch.zeros_like(features.grad[~candidate_mask])
+    )
+
+
+def test_unified_model_loads_legacy_backbone_state_and_owns_context():
+    legacy_backbone = nn.Linear(4, 4)
+    legacy_state = legacy_backbone.state_dict()
+    model = UnifiedBackboneFeatureModel(
+        nn.Linear(4, 4), feat_dim=4, hidden_dim=8, num_heads=2
+    )
+
+    model.load_state_dict(legacy_state)
+
+    assert torch.equal(model.backbone.weight, legacy_state['weight'])
+    assert any(key.startswith('feature_context.') for key in model.state_dict())
 
 
 class CollapsingFeatureRefiner(nn.Module):

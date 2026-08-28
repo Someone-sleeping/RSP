@@ -10,6 +10,8 @@ from lib.stage3_pipeline import Stage3Config, reindex_split_regions, split_super
 class Stage2FeatureConfig:
     """Split-and-grow feature refinement used during GrowSP Stage 2."""
 
+    # Kept for loading old experiment arguments. The unified context layer
+    # outputs features directly and does not scale an external residual.
     residual_scale: float = 0.1
     backbone_gradient_scale: float = 0.1
     query_scale: float = 10.0
@@ -203,10 +205,7 @@ def _verify_feature_splits(
             refined_score = _child_structure_score(
                 proposed_features.detach(), parent_mask, split.targets, config.separation_weight
             )
-            applied_residual_norm = (
-                float(config.residual_scale)
-                * residual.detach()[candidate].norm(dim=1).mean()
-            )
+            applied_residual_norm = residual.detach()[candidate].norm(dim=1).mean()
             primitive_consistent = _primitive_partition_is_consistent(
                 config,
                 base_features.detach(),
@@ -271,6 +270,10 @@ def run_stage2_feature_pipeline(
     primitive_to_semantic=None,
 ):
     """Refine candidate features and commit only structurally safe updates."""
+    # Training already supplies normalized embeddings, while clustering obtains
+    # raw backbone activations. A shared scale is required for verifier update
+    # norms and prevents normalization itself from looking like a correction.
+    point_features = F.normalize(point_features, dim=1)
     # Candidate discovery is a non-differentiable decision made from the current
     # state. Once selected, its feature objective jointly trains the backbone and
     # Refiner; non-candidate context is detached inside the Refiner.
@@ -284,16 +287,31 @@ def run_stage2_feature_pipeline(
         regions,
         batch_ids,
     )
-    proposed_features, residual = feature_refiner.refine(
-        point_features,
-        coordinates,
-        batch_ids,
-        split.query_indices,
-        split.candidate_mask,
-        regions=split.dynamic_regions,
-        residual_scale=config.residual_scale,
-        backbone_gradient_scale=config.backbone_gradient_scale,
-    )
+    if hasattr(feature_refiner, "refine_candidate_features"):
+        proposed_features, _ = feature_refiner.refine_candidate_features(
+            point_features,
+            coordinates,
+            batch_ids,
+            split.query_indices,
+            split.candidate_mask,
+            regions=split.dynamic_regions,
+            backbone_gradient_scale=config.backbone_gradient_scale,
+        )
+    else:
+        # Compatibility path for archived external residual adapters.
+        proposed_features, _ = feature_refiner.refine(
+            point_features,
+            coordinates,
+            batch_ids,
+            split.query_indices,
+            split.candidate_mask,
+            regions=split.dynamic_regions,
+            residual_scale=config.residual_scale,
+            backbone_gradient_scale=config.backbone_gradient_scale,
+        )
+    # Verification and regularization use the actual feature displacement,
+    # independent of how a model parameterizes its internal context update.
+    residual = proposed_features - point_features
     (
         targets,
         decomposition_mask,
@@ -365,10 +383,13 @@ def stage2_feature_losses(
     semantic_scale=3.0,
 ):
     """Feature-space objectives for accepted child regions."""
-    mask = output.supervision_mask
+    # A candidate feature update contributes gradients only after verification.
+    # Accepted decomposition without accepted refinement can still alter the
+    # region structure, but cannot train an unsupported feature transformation.
+    mask = output.accept_mask
     zero = output.refined_features.sum() * 0.0
     if mask.any():
-        logits = F.linear(F.normalize(output.proposed_features[mask], dim=1), semantic_centers)
+        logits = F.linear(F.normalize(output.refined_features[mask], dim=1), semantic_centers)
         point_loss = F.cross_entropy(
             logits * semantic_scale,
             output.supervision_targets[mask],
@@ -404,7 +425,7 @@ def stage2_feature_losses(
         valid_primitive = primitive_targets >= 0
         if valid_primitive.any():
             primitive_logits = F.linear(
-                F.normalize(output.proposed_features[mask][valid_primitive], dim=1),
+                F.normalize(output.refined_features[mask][valid_primitive], dim=1),
                 primitive_centers,
             )
             point_loss = F.cross_entropy(
@@ -424,7 +445,7 @@ def stage2_feature_losses(
                 continue
             structure_terms.append(
                 -_child_structure_score(
-                    output.proposed_features,
+                    output.refined_features,
                     parent_mask,
                     output.supervision_targets,
                     separation_weight=0.25,
@@ -432,8 +453,8 @@ def stage2_feature_losses(
             )
     structure_loss = torch.stack(structure_terms).mean() if structure_terms else zero
     residual_loss = (
-        output.residual_features[output.candidate_mask].pow(2).mean()
-        if output.candidate_mask.any()
+        output.residual_features[mask].pow(2).mean()
+        if mask.any()
         else zero
     )
     return {

@@ -8,6 +8,7 @@ import wandb
 import shutil
 import logging
 import datetime
+import copy
 import numpy as np
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
@@ -36,6 +37,7 @@ except Exception:
     umap = None
 from models.fpn import Res16FPN18
 from models.res16unet import Res16UNet14
+from models.unified_feature_model import UnifiedBackboneFeatureModel
 
 
 def compute_multiscale_geometry(coords, normals, region, scales=[0.1, 1.0]):
@@ -272,9 +274,13 @@ def load_resume_checkpoint(
         return 0, 0, False  # start_epoch, start_grow_epoch, is_Growing
 
     checkpoint = torch.load(args.resume, map_location='cpu')
-    args.resume_has_feature_refiner = 'feature_refiner_state_dict' in checkpoint
+    model_state = checkpoint['model_state_dict']
+    args.resume_has_feature_refiner = (
+        'feature_refiner_state_dict' in checkpoint
+        or any(key.startswith('feature_context.') for key in model_state)
+    )
     args.resume_training_stage = checkpoint.get('training_stage', '')
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_state_dict(model_state)
     if refiner is not None:
         if 'refiner_state_dict' in checkpoint:
             try:
@@ -296,16 +302,50 @@ def load_resume_checkpoint(
             feature_refiner.load_state_dict(checkpoint['feature_refiner_state_dict'])
         else:
             logger.info("Resume checkpoint has no feature_refiner_state_dict; initializing it from scratch.")
+    optimizer_restored = optimizer is None
     if optimizer is not None and 'optimizer_state_dict' in checkpoint:
         try:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            optimizer_restored = True
         except ValueError as exc:
-            logger.info(f"Optimizer state was not restored: {exc}")
-    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+            old_optimizer_state = checkpoint['optimizer_state_dict']
+            current_optimizer_state = optimizer.state_dict()
+            can_expand_legacy_group = (
+                len(old_optimizer_state['param_groups']) == 1
+                and len(current_optimizer_state['param_groups']) == 2
+                and len(old_optimizer_state['param_groups'][0]['params'])
+                == len(current_optimizer_state['param_groups'][0]['params'])
+            )
+            if can_expand_legacy_group:
+                migrated_state = copy.deepcopy(current_optimizer_state)
+                migrated_state['state'] = copy.deepcopy(old_optimizer_state['state'])
+                legacy_group = copy.deepcopy(old_optimizer_state['param_groups'][0])
+                legacy_group['params'] = migrated_state['param_groups'][0]['params']
+                legacy_group.update({
+                    'name': migrated_state['param_groups'][0].get('name', 'backbone'),
+                    'poly_schedule': True,
+                })
+                migrated_state['param_groups'][0] = legacy_group
+                optimizer.load_state_dict(migrated_state)
+                optimizer_restored = True
+                logger.info(
+                    "Migrated legacy backbone optimizer state into the unified optimizer."
+                )
+            else:
+                logger.info(f"Optimizer state was not restored: {exc}")
+    if scheduler is not None and 'scheduler_state_dict' in checkpoint and optimizer_restored:
         try:
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            scheduler_state = copy.deepcopy(checkpoint['scheduler_state_dict'])
+            group_count = len(optimizer.param_groups) if optimizer is not None else 1
+            if len(scheduler_state.get('base_lrs', [])) == 1 and group_count == 2:
+                scheduler_state['base_lrs'].append(scheduler.base_lrs[1])
+                scheduler_state['_last_lr'].append(optimizer.param_groups[1]['lr'])
+                scheduler_state['lr_lambdas'].append(None)
+            scheduler.load_state_dict(scheduler_state)
         except ValueError as exc:
             logger.info(f"Scheduler state was not restored: {exc}")
+    elif scheduler is not None and 'scheduler_state_dict' in checkpoint:
+        logger.info("Scheduler state was not restored because optimizer groups changed.")
     if learnable_sp_optimizer is not None and 'learnable_sp_optimizer_state_dict' in checkpoint:
         try:
             learnable_sp_optimizer.load_state_dict(checkpoint['learnable_sp_optimizer_state_dict'])
@@ -644,12 +684,27 @@ class WandbHandler(logging.Handler):
 
 
 def build_model(model_name='res16fpn18', **kwargs):
+    config = kwargs.get('config')
     if model_name == 'res16fpn18':
-        return Res16FPN18(**kwargs)
+        backbone = Res16FPN18(**kwargs)
     elif model_name == 'res16unet14':
-        return Res16UNet14(**kwargs)
+        backbone = Res16UNet14(**kwargs)
     else:
         raise ValueError(f'Unknown model: {model_name}')
+
+    if config is not None and getattr(config, 'stage2_split_refine_enable', False):
+        # Keep paired baseline/refiner runs on the same data-order RNG stream.
+        cpu_rng_state = torch.get_rng_state()
+        model = UnifiedBackboneFeatureModel(
+            backbone,
+            feat_dim=getattr(config, 'feats_dim', 128),
+            hidden_dim=getattr(config, 'refine_hidden_dim', 128),
+            num_heads=getattr(config, 'refine_num_heads', 4),
+            dropout=getattr(config, 'refine_dropout', 0.0),
+        )
+        torch.set_rng_state(cpu_rng_state)
+        return model
+    return backbone
 
 
 # 定义空间平滑函数 (可放置在训练循环外部)

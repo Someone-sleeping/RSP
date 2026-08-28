@@ -11,7 +11,6 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from models.fpn import Res16FPN18
 from models.query_refiner import CandidateBasedRefiner, refined_cross_entropy, refinement_keep_kl, delta_l2
-from models.feature_refiner import CandidateFeatureRefiner
 from models.learnable_superpoint import (
     SemanticDifferenceSuperpointLearner,
     verified_region_supervision_loss,
@@ -163,7 +162,8 @@ def parse_args():
                         help='enable split-aware contextual feature refinement during Stage 2')
     parser.add_argument('--stage2_split_start_ratio', type=float, default=0.75,
                         help='fraction of Stage 2 completed before split-aware refinement starts')
-    parser.add_argument('--stage2_feature_refiner_lr', type=float, default=1e-4)
+    parser.add_argument('--stage2_feature_refiner_lr', type=float, default=1e-2,
+                        help='SGD learning rate for the context group inside the unified model')
     parser.add_argument('--stage2_feature_residual_scale', type=float, default=0.1)
     parser.add_argument('--stage2_backbone_gradient_scale', type=float, default=0.1)
     parser.add_argument('--stage2_split_lambda', type=float, default=0.2)
@@ -198,6 +198,35 @@ def parse_test_areas(test_area):
     if not areas:
         raise ValueError('test_area must contain at least one S3DIS area')
     return areas
+
+
+def build_training_optimizer(args, model, backbone_lr=None):
+    """Build one optimizer for both backbone and integrated feature context."""
+    backbone_lr = args.lr if backbone_lr is None else float(backbone_lr)
+    if hasattr(model, 'context_parameters'):
+        parameter_groups = [
+            {
+                'params': list(model.backbone_parameters()),
+                'lr': backbone_lr,
+                'poly_schedule': True,
+                'name': 'backbone',
+            },
+            {
+                'params': list(model.context_parameters()),
+                'lr': args.stage2_feature_refiner_lr,
+                'poly_schedule': False,
+                'name': 'feature_context',
+            },
+        ]
+    else:
+        parameter_groups = model.parameters()
+    return torch.optim.SGD(
+        parameter_groups,
+        lr=backbone_lr,
+        momentum=args.momentum,
+        dampening=args.dampening,
+        weight_decay=args.weight_decay,
+    )
 
 
 def main(args, logger):
@@ -269,22 +298,11 @@ def main(args, logger):
             temperature=args.learnable_sp_temperature,
         ).cuda()
         logger.info(learnable_sp)
-    feature_refiner = None
     stage2_feature_config = None
     stage2_feature_module = None
     if args.stage2_split_refine_enable:
-        # Auxiliary-module initialization must not alter the backbone's data
-        # shuffle or augmentation stream in paired Stage-2 experiments.
-        cpu_rng_state = torch.get_rng_state()
-        cuda_rng_state = torch.cuda.get_rng_state_all()
-        feature_refiner = CandidateFeatureRefiner(
-            feat_dim=args.feats_dim,
-            hidden_dim=args.refine_hidden_dim,
-            num_heads=args.refine_num_heads,
-            dropout=args.refine_dropout,
-        ).cuda()
-        torch.set_rng_state(cpu_rng_state)
-        torch.cuda.set_rng_state_all(cuda_rng_state)
+        if not hasattr(model, 'refine_candidate_features'):
+            raise TypeError('Stage-2 feature refinement requires the unified model wrapper.')
         stage2_feature_config = Stage2FeatureConfig(
             residual_scale=args.stage2_feature_residual_scale,
             backbone_gradient_scale=args.stage2_backbone_gradient_scale,
@@ -303,12 +321,12 @@ def main(args, logger):
             primitive_top_k=args.stage2_primitive_top_k,
             primitive_support_tolerance=args.stage2_primitive_support_tolerance,
         )
-        stage2_feature_module = Stage2FeatureModule(feature_refiner, stage2_feature_config)
-        logger.info(feature_refiner)
+        stage2_feature_module = Stage2FeatureModule(model, stage2_feature_config)
+        logger.info(model.feature_context)
 
     optimizer = None
     if not args.refine_freeze_backbone:
-        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, dampening=args.dampening, weight_decay=args.weight_decay)
+        optimizer = build_training_optimizer(args, model)
     refiner_optimizer = None
     if args.refine_enable:
         refiner_optimizer = torch.optim.AdamW(
@@ -321,19 +339,10 @@ def main(args, logger):
             lr=args.learnable_sp_lr,
             weight_decay=args.learnable_sp_weight_decay,
         )
-    feature_refiner_optimizer = None
-    if feature_refiner is not None:
-        feature_refiner_optimizer = torch.optim.AdamW(
-            feature_refiner.parameters(),
-            lr=args.stage2_feature_refiner_lr,
-            weight_decay=args.refine_weight_decay,
-        )
     scheduler = None if optimizer is None else PolyLR(optimizer, max_iter=args.max_iter[0])
     start_epoch, start_grow_epoch, is_Growing = load_resume_checkpoint(
         args, model, optimizer, scheduler, logger, refiner=candidate_refiner,
         learnable_sp=learnable_sp, learnable_sp_optimizer=learnable_sp_optimizer,
-        feature_refiner=feature_refiner,
-        feature_refiner_optimizer=feature_refiner_optimizer,
     )
     teacher_classifier = None
     if args.refine_teacher_ckpt_dir:
@@ -348,16 +357,11 @@ def main(args, logger):
         start_epoch, start_grow_epoch, is_Growing = load_resume_checkpoint(
             args, model, optimizer, scheduler, logger, refiner=candidate_refiner,
             learnable_sp=learnable_sp, learnable_sp_optimizer=learnable_sp_optimizer,
-            feature_refiner=feature_refiner,
-            feature_refiner_optimizer=feature_refiner_optimizer,
         )
     if args.start_stage2_from_resume:
         is_Growing = True
         start_grow_epoch = start_epoch
-        optimizer = torch.optim.SGD(
-            model.parameters(), lr=args.lr, momentum=args.momentum,
-            dampening=args.dampening, weight_decay=args.weight_decay,
-        )
+        optimizer = build_training_optimizer(args, model)
         scheduler = PolyLR(optimizer, max_iter=args.max_iter[1])
         logger.info(
             'Resume epoch {} is used as the explicit Stage-2 growing start.'.format(start_epoch)
@@ -410,7 +414,7 @@ def main(args, logger):
                 logger.info('### Superpoints Begin Grwoing ###')
                 logger.info('#################################')
                 if optimizer is not None:
-                    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, dampening=args.dampening, weight_decay=args.weight_decay)
+                    optimizer = build_training_optimizer(args, model)
                     scheduler = PolyLR(optimizer, max_iter=args.max_iter[1])
                 break
 
@@ -448,8 +452,7 @@ def main(args, logger):
         if split_refine_active:
             train_stage2_split_refiner(
                 train_loader, logger, model, optimizer, scheduler, classifier,
-                primitive_to_semantic, feature_refiner,
-                feature_refiner_optimizer, stage2_feature_config, epoch,
+                primitive_to_semantic, stage2_feature_config, epoch,
             )
         else:
             train(
@@ -465,8 +468,6 @@ def main(args, logger):
                 args, epoch, model, optimizer, scheduler, classifier, is_Growing, start_grow_epoch, logger,
                 refiner=candidate_refiner if args.refine_enable else None,
                 learnable_sp=learnable_sp, learnable_sp_optimizer=learnable_sp_optimizer,
-                feature_refiner=feature_refiner if split_refine_active else None,
-                feature_refiner_optimizer=feature_refiner_optimizer if split_refine_active else None,
             )
             with torch.no_grad():
                 o_Acc, m_Acc, s = eval(epoch, args, test_areas)
@@ -490,10 +491,7 @@ def main(args, logger):
         logger.info('############################################################')
         stage3_config = Stage3Config(residual_scale=args.stage3_residual_scale)
         superpoint_decomposer = SuperpointDecomposer(stage3_config)
-        optimizer = torch.optim.SGD(
-            model.parameters(), lr=args.stage3_lr, momentum=args.momentum,
-            dampening=args.dampening, weight_decay=args.weight_decay,
-        )
+        optimizer = build_training_optimizer(args, model, backbone_lr=args.stage3_lr)
         refiner_optimizer = torch.optim.AdamW(
             candidate_refiner.parameters(), lr=args.stage3_refiner_lr,
             weight_decay=args.refine_weight_decay,
@@ -1049,15 +1047,12 @@ def train_stage2_split_refiner(
     scheduler,
     classifier,
     primitive_to_semantic,
-    feature_refiner,
-    feature_refiner_optimizer,
     feature_config,
     epoch,
 ):
-    """Jointly optimize GrowSP features and split-aware context refinement."""
+    """Jointly optimize the unified backbone and candidate feature context."""
     train_loader.dataset.mode = 'train'
     model.train()
-    feature_refiner.train()
     semantic_centers = build_semantic_classifier(
         classifier, primitive_to_semantic, args.semantic_class
     ).detach()
@@ -1092,7 +1087,7 @@ def train_stage2_split_refiner(
 
         output = run_stage2_feature_pipeline(
             feature_config,
-            feature_refiner,
+            model,
             point_features,
             point_coords,
             point_colors,
@@ -1122,10 +1117,8 @@ def train_stage2_split_refiner(
         )
 
         optimizer.zero_grad()
-        feature_refiner_optimizer.zero_grad()
         total_loss.backward()
         optimizer.step()
-        feature_refiner_optimizer.step()
         scheduler.step()
 
         running['total'] += float(total_loss.detach().item())
@@ -1298,7 +1291,12 @@ class LambdaStepLR(LambdaLR):
 class PolyLR(LambdaStepLR):
   """DeepLab learning rate policy"""
   def __init__(self, optimizer, max_iter=30000, power=0.9, last_step=-1):
-    super(PolyLR, self).__init__(optimizer, lambda s: (1 - s / (max_iter + 1))**power, last_step)
+    poly = lambda s: (1 - s / (max_iter + 1))**power
+    schedules = [
+        poly if group.get('poly_schedule', True) else (lambda _s: 1.0)
+        for group in optimizer.param_groups
+    ]
+    super(PolyLR, self).__init__(optimizer, schedules, last_step)
 
 
 def get_current_lr(scheduler, refiner_optimizer=None):
