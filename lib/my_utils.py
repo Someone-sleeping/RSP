@@ -433,42 +433,38 @@ def save_checkpoints(
 
 
 def compute_type1_centers(sp_feats, primitive_labels, primitive_centers, args, logger, sp_feats_rgb, sp_feats_region_num=None):
-    """处理 Type 1 逻辑：基于颜色一致性的中心计算与权重分配"""
-    primitive_loss_weight = torch.zeros((args.primitive_num))
-    count = 0
+    """Refine primitive centers with feature-color reliability, without GT."""
+    from lib.tcc import refine_primitive_centers
 
-    # 记录用于可视化的列表
-    centers_origin_list = []
-    centers_new_list = []
-    valid_cluster_indices = []
-
-    for cluster_idx in range(args.primitive_num):
-        indices = primitive_labels == cluster_idx
-        domin_ind, s1 = compute_color_consistency(sp_feats_rgb[indices])
-
-        if s1['consistency_var'] > 0.14:
-            cluster_avg = sp_feats[indices].mean(0, keepdims=True)
-            weight = 1.0
-        elif s1['dominant_ratio'] >= 0.5:
-            count += 1
-            cluster_avg = sp_feats[indices][domin_ind].mean(0, keepdims=True)
-            weight = 1.0
-        else:
-            cluster_avg = sp_feats[indices].mean(0, keepdims=True)
-            weight = 0.5
-
-        primitive_centers[cluster_idx] = cluster_avg
-        primitive_loss_weight[cluster_idx] = weight
-
-        valid_cluster_indices.append(cluster_idx)
-        centers_origin_list.append(sp_feats[indices].mean(0, keepdims=True))
-        centers_new_list.append(cluster_avg)
-
-    logger.info(f'unmatched center num == {count}')
-    save_path = f'{args.pseudo_label_path}/primitive_loss_weight.pt'
+    color_scale = max(float(getattr(args, 'c_rgb', 1.0)), 1e-6)
+    centers, primitive_loss_weight, summary = refine_primitive_centers(
+        sp_feats,
+        primitive_labels,
+        args.primitive_num,
+        colors=sp_feats_rgb / color_scale,
+        feature_temperature=getattr(args, 'tcc_feature_temperature', 0.10),
+        color_sigma=getattr(args, 'tcc_color_sigma', 0.20),
+        color_weight=getattr(args, 'tcc_color_weight', 0.25),
+        center_strength=getattr(args, 'tcc_center_strength', 0.50),
+        min_effective_ratio=getattr(args, 'tcc_min_effective_ratio', 0.25),
+        loss_weight_strength=getattr(args, 'tcc_loss_weight_strength', 0.25),
+        min_loss_weight=getattr(args, 'tcc_min_loss_weight', 0.50),
+    )
+    primitive_centers.copy_(centers)
+    logger.info(
+        'TCC refined %d centers: shift %.6f, effective support %.3f, '
+        'reliability %.3f, loss weight [%.3f, %.3f]',
+        summary.refined_clusters,
+        summary.mean_center_shift,
+        summary.mean_effective_ratio,
+        summary.mean_reliability,
+        float(primitive_loss_weight.min().item()),
+        float(primitive_loss_weight.max().item()),
+    )
+    os.makedirs(args.pseudo_label_path, exist_ok=True)
+    save_path = os.path.join(args.pseudo_label_path, 'primitive_loss_weight.pt')
     torch.save(primitive_loss_weight, save_path)
-    logger.info(f"Saved primitive info to {save_path}")
-    # visualize_cluster_refinement(sp_feats, primitive_labels, valid_cluster_indices, centers_origin_list, centers_new_list, args)
+    logger.info(f"Saved primitive reliability to {save_path}")
 
     return primitive_centers
 
@@ -572,10 +568,11 @@ def visualize_cluster_refinement(sp_feats, primitive_labels, valid_cluster_indic
 
 
 def setup_loss_weight(args, loss):
-    """阶段一：如果开启 region_weight_enable，动态加载并替换 loss 的权重"""
-    if getattr(args, 'region_weight_enable', False):
-        weight_path = f'{args.pseudo_label_path}/primitive_loss_weight.pt'
-        primitive_loss_weight = torch.load(weight_path, map_location="cpu").cuda()
+    """Load cluster reliability for ordinary GrowSP primitive CE."""
+    from lib.tcc import load_primitive_reliability
+
+    primitive_loss_weight = load_primitive_reliability(args, device='cuda')
+    if primitive_loss_weight is not None:
         loss.weight = primitive_loss_weight
     return loss
 

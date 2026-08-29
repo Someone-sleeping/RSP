@@ -101,6 +101,20 @@ def parse_args():
     parser.add_argument('--z_enable', action='store_true', default=False, help='Enable fixed weight')
     parser.add_argument('--fixed_weight', action='store_true', default=False, help='Enable fixed weight')
     parser.add_argument('--tcc_enable', action='store_true', default=False, help='Enable TCC')
+    parser.add_argument('--tcc_feature_temperature', type=float, default=0.10,
+                        help='feature reliability temperature for robust primitive centers')
+    parser.add_argument('--tcc_color_sigma', type=float, default=0.20,
+                        help='RGB distance scale in the normalized [-0.5, 0.5] space')
+    parser.add_argument('--tcc_color_weight', type=float, default=0.25,
+                        help='relative contribution of color reliability')
+    parser.add_argument('--tcc_center_strength', type=float, default=0.50,
+                        help='maximum interpolation from mean to robust primitive center')
+    parser.add_argument('--tcc_min_effective_ratio', type=float, default=0.25,
+                        help='minimum effective support before moving a primitive center')
+    parser.add_argument('--tcc_loss_weight_strength', type=float, default=0.25,
+                        help='strength of primitive reliability weighting in CE')
+    parser.add_argument('--tcc_min_loss_weight', type=float, default=0.50,
+                        help='lower bound for primitive CE reliability weights')
     parser.add_argument('--region_weight_enable', action='store_true', default=False, help='Enable region weight')
     parser.add_argument('--double_ssl', action='store_true', default=False, help='Enable double SSL')
     parser.add_argument('--plot', action='store_true', default=False, help='Enable double SSL')
@@ -235,6 +249,19 @@ def build_training_optimizer(args, model, backbone_lr=None):
 
 
 def main(args, logger):
+    if args.tcc_enable:
+        if args.tcc_feature_temperature <= 0 or args.tcc_color_sigma <= 0:
+            raise ValueError('TCC temperatures must be positive.')
+        bounded_tcc_args = {
+            'tcc_color_weight': args.tcc_color_weight,
+            'tcc_center_strength': args.tcc_center_strength,
+            'tcc_min_effective_ratio': args.tcc_min_effective_ratio,
+            'tcc_loss_weight_strength': args.tcc_loss_weight_strength,
+            'tcc_min_loss_weight': args.tcc_min_loss_weight,
+        }
+        invalid = [name for name, value in bounded_tcc_args.items() if not 0.0 <= value <= 1.0]
+        if invalid:
+            raise ValueError('TCC parameters must be in [0, 1]: {}'.format(', '.join(invalid)))
     if args.stage3_enable and (args.refine_freeze_backbone or args.refine_teacher_ckpt_dir):
         raise ValueError('Stage 3 jointly trains the backbone and cannot use the frozen-teacher mode.')
     if args.stage3_enable and args.learnable_sp_enable:
@@ -1077,6 +1104,10 @@ def train_stage2_feature_model(
     semantic_centers = build_semantic_classifier(
         classifier, primitive_to_semantic, args.semantic_class
     ).detach()
+    from lib.tcc import load_primitive_reliability
+    primitive_loss_weight = load_primitive_reliability(
+        args, device=classifier.weight.device
+    )
     running = {
         'total': 0.0,
         'primitive': 0.0,
@@ -1125,13 +1156,17 @@ def train_stage2_feature_model(
             output.verified_features, F.normalize(classifier.weight)
         )
         primitive_loss = F.cross_entropy(
-            primitive_logits * 3, pseudo_labels, ignore_index=-1
+            primitive_logits * 3,
+            pseudo_labels,
+            weight=primitive_loss_weight,
+            ignore_index=-1,
         )
         feature_losses = stage2_feature_losses(
             output,
             semantic_centers,
             classifier.weight,
             primitive_to_semantic,
+            primitive_loss_weight=primitive_loss_weight,
         )
         total_loss = (
             primitive_loss

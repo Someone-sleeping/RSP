@@ -402,6 +402,7 @@ def stage2_feature_losses(
     primitive_centers=None,
     primitive_to_semantic=None,
     semantic_scale=3.0,
+    primitive_loss_weight=None,
 ):
     """Feature-space objectives for accepted child regions."""
     # A candidate feature update contributes gradients only after verification.
@@ -454,6 +455,7 @@ def stage2_feature_losses(
             point_loss = F.cross_entropy(
                 primitive_logits * semantic_scale,
                 primitive_targets[valid_primitive],
+                weight=primitive_loss_weight,
                 reduction="none",
             )
             weights = output.supervision_confidence[mask][valid_primitive].detach().clamp_min(1e-3)
